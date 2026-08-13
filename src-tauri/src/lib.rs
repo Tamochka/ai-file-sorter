@@ -9,7 +9,7 @@ use walkdir::WalkDir;
 struct AiSettings { provider: String, base_url: String, model: String, api_key: String, cloud_consent: bool }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SortSettings { mode: String, custom_prompt: String, text_limit: usize, total_limit: usize }
+struct SortSettings { mode: String, custom_prompt: String, text_limit: usize, total_limit: usize, #[serde(default)] unlimited: bool }
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct PlanItem { id: String, source: String, relative_path: String, target: String, category: String, explanation: String, confidence: f32, included: bool, warning: Option<String> }
@@ -42,8 +42,9 @@ fn analyze_folder(folder: String, ai: AiSettings, sort: SortSettings) -> Result<
     if skip_file(path) { continue; }
     let metadata = match fs::metadata(path) { Ok(data) => data, Err(_) => { warnings.push(format!("Нет доступа к {}", relative.display())); continue; } };
     let ext = path.extension().and_then(|x| x.to_str()).unwrap_or("").to_lowercase();
-    let remaining = sort.total_limit.saturating_sub(total_chars);
-    let (content_extract, content_status) = read_text_preview(path, &ext, sort.text_limit.min(remaining));
+    let remaining = if sort.unlimited { usize::MAX } else { sort.total_limit.saturating_sub(total_chars) };
+    let per_file_limit = if sort.unlimited { usize::MAX } else { sort.text_limit };
+    let (content_extract, content_status) = read_text_preview(path, &ext, per_file_limit.min(remaining));
     total_chars = total_chars.saturating_add(content_extract.as_ref().map_or(0, |text| text.chars().count()));
     let (category, confidence, explanation) = classify(relative, &ext, &sort);
     let date = metadata.modified().ok().map(|t| DateTime::<Local>::from(t).format("%Y/%m").to_string()).unwrap_or_else(|| "Без даты".into());
@@ -55,7 +56,7 @@ fn analyze_folder(folder: String, ai: AiSettings, sort: SortSettings) -> Result<
   }
   if sort.mode == "custom" && sort.custom_prompt.trim().is_empty() { warnings.push("Кастомный режим без инструкции использовал стандартные категории.".into()); }
   if let Err(error) = refine_with_model(&ai, &sort, &mut items, &contexts) { warnings.push(format!("Модель не уточнила план: {error}. Использована локальная оценка по метаданным.")); }
-  if total_chars >= sort.total_limit { warnings.push("Достигнут общий лимит текста. Часть файлов будет оценена по имени и метаданным.".into()); }
+  if !sort.unlimited && total_chars >= sort.total_limit { warnings.push("Достигнут общий лимит текста. Часть файлов будет оценена по имени и метаданным.".into()); }
   Ok(AnalysisResult { total_files: items.len(), estimated_chars: total_chars, items, warnings })
 }
 
@@ -157,4 +158,4 @@ fn refine_with_model(ai: &AiSettings, sort: &SortSettings, items: &mut [PlanItem
 pub fn run() { tauri::Builder::default().plugin(tauri_plugin_dialog::init()).invoke_handler(tauri::generate_handler![analyze_folder, apply_sort, undo_last_sort, test_connection, list_models]).run(tauri::generate_context!()).expect("ошибка запуска Tauri"); }
 
 #[cfg(test)]
-mod tests { use super::*; #[test] fn target_rejects_escape() { assert!(safe_destination(Path::new("/tmp/root"), "../out").is_err()); } #[test] fn names_are_sanitized() { assert_eq!(safe_name("A/B: C"), "A_B_ C"); } #[test] fn standard_categories_work() { let sort = SortSettings { mode:"standard".into(), custom_prompt:"".into(), text_limit:1, total_limit:1 }; assert_eq!(classify(Path::new("tax_invoice.pdf"), "pdf", &sort).0, "Финансы"); } #[test] fn installers_go_to_downloaders() { let sort = SortSettings { mode:"standard".into(), custom_prompt:"".into(), text_limit:1, total_limit:1 }; assert_eq!(classify(Path::new("Discord.dmg"), "dmg", &sort).0, "Загрузчики"); assert_eq!(classify(Path::new("coconut_latest.zip"), "zip", &sort).0, "Загрузчики"); } }
+mod tests { use super::*; #[test] fn target_rejects_escape() { assert!(safe_destination(Path::new("/tmp/root"), "../out").is_err()); } #[test] fn names_are_sanitized() { assert_eq!(safe_name("A/B: C"), "A_B_ C"); } #[test] fn standard_categories_work() { let sort = SortSettings { mode:"standard".into(), custom_prompt:"".into(), text_limit:1, total_limit:1, unlimited:false }; assert_eq!(classify(Path::new("tax_invoice.pdf"), "pdf", &sort).0, "Финансы"); } #[test] fn installers_go_to_downloaders() { let sort = SortSettings { mode:"standard".into(), custom_prompt:"".into(), text_limit:1, total_limit:1, unlimited:false }; assert_eq!(classify(Path::new("Discord.dmg"), "dmg", &sort).0, "Загрузчики"); assert_eq!(classify(Path::new("coconut_latest.zip"), "zip", &sort).0, "Загрузчики"); } }
