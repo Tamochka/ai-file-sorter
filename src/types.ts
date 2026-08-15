@@ -8,3 +8,4 @@ export interface SortSettings { mode: SortMode; customPrompt: string; textLimit:
 export interface PlanItem { id: string; source: string; relativePath: string; target: string; category: string; explanation: string; confidence: number; included: boolean; warning?: string; aiStatus: AiStatus; aiError?: string; }
 export interface AiSummary { aiProcessed: number; retrySucceeded: number; aiUnprocessed: number; }
 export interface AnalysisResult { items: PlanItem[]; totalFiles: number; estimatedChars: number; warnings: string[]; summary: AiSummary; }
+export interface AnalysisProgress { phase: "scanning" | "main" | "retry" | "complete"; completedBatches: number; totalBatches: number; processedFiles: number; pendingFiles: number; message: string; }

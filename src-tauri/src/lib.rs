@@ -3,12 +3,19 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    future::Future,
     path::{Component, Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
 };
+use tauri::Emitter;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct AiSettings {
     provider: String,
@@ -17,7 +24,7 @@ struct AiSettings {
     api_key: String,
     cloud_consent: bool,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct SortSettings {
     mode: String,
@@ -97,18 +104,53 @@ struct ModelList {
     active_model: Option<String>,
 }
 
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AnalysisProgress {
+    phase: String,
+    completed_batches: usize,
+    total_batches: usize,
+    processed_files: usize,
+    pending_files: usize,
+    message: String,
+}
+
+#[derive(Default)]
+struct AnalysisControl {
+    cancelled: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
+}
+
+struct AnalysisGuard(Arc<AtomicBool>);
+
+impl Drop for AnalysisGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+struct PreparedAnalysis {
+    items: Vec<PlanItem>,
+    contexts: Vec<AiFileContext>,
+    total_chars: usize,
+    warnings: Vec<String>,
+}
+
 const SORTED_DIR: &str = "AI Sorted";
 const UNPROCESSED_CATEGORY: &str = "Не обработано ИИ";
 const HISTORY_FILE: &str = ".ai-file-sorter-last-operation.json";
 const AI_BATCH_SIZE: usize = 10;
+const AI_BATCH_TIMEOUT: Duration = Duration::from_secs(90);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[tauri::command]
-fn analyze_folder(
+async fn analyze_folder(
+    app: tauri::AppHandle,
+    control: tauri::State<'_, AnalysisControl>,
     folder: String,
     ai: AiSettings,
     sort: SortSettings,
 ) -> Result<AnalysisResult, String> {
-    let root = canonical_root(&folder)?;
     if ai.model.trim().is_empty() {
         return Err("Укажите имя модели".into());
     }
@@ -119,6 +161,86 @@ fn analyze_folder(
     if !is_local && !ai.cloud_consent {
         return Err("Нужно подтвердить передачу данных в облако".into());
     }
+    if control
+        .running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err("Анализ уже выполняется".into());
+    }
+    control.cancelled.store(false, Ordering::Release);
+    let _guard = AnalysisGuard(control.running.clone());
+    let cancelled = control.cancelled.clone();
+
+    emit_progress(
+        &app,
+        AnalysisProgress {
+            phase: "scanning".into(),
+            completed_batches: 0,
+            total_batches: 0,
+            processed_files: 0,
+            pending_files: 0,
+            message: "Сканирование файлов…".into(),
+        },
+    );
+
+    let scan_cancelled = cancelled.clone();
+    let scan_sort = sort.clone();
+    let prepared = tauri::async_runtime::spawn_blocking(move || {
+        prepare_analysis(folder, &scan_sort, &scan_cancelled)
+    })
+    .await
+    .map_err(|error| format!("Фоновый анализ завершился аварийно: {error}"))??;
+
+    if cancelled.load(Ordering::Acquire) {
+        return Err("Анализ отменён пользователем".into());
+    }
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(AI_BATCH_TIMEOUT + Duration::from_secs(5))
+        .build()
+        .map_err(|error| format!("Не удалось создать HTTP-клиент: {error}"))?;
+
+    let PreparedAnalysis {
+        mut items,
+        contexts,
+        total_chars,
+        mut warnings,
+    } = prepared;
+    let progress_app = app.clone();
+    let refinement = refine_with_model(
+        &client,
+        &ai,
+        &sort,
+        &mut items,
+        &contexts,
+        cancelled,
+        move |progress| emit_progress(&progress_app, progress),
+    )
+    .await?;
+    warnings.extend(refinement.warnings);
+    if !sort.unlimited && total_chars >= sort.total_limit {
+        warnings.push(
+            "Достигнут общий лимит текста. Часть файлов будет оценена по имени и метаданным."
+                .into(),
+        );
+    }
+    Ok(AnalysisResult {
+        total_files: items.len(),
+        estimated_chars: total_chars,
+        items,
+        warnings,
+        summary: refinement.summary,
+    })
+}
+
+fn prepare_analysis(
+    folder: String,
+    sort: &SortSettings,
+    cancelled: &AtomicBool,
+) -> Result<PreparedAnalysis, String> {
+    let root = canonical_root(&folder)?;
     let mut total_chars = 0usize;
     let mut items = Vec::new();
     let mut contexts = Vec::new();
@@ -129,6 +251,9 @@ fn analyze_folder(
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_file())
     {
+        if cancelled.load(Ordering::Acquire) {
+            return Err("Анализ отменён пользователем".into());
+        }
         let path = entry.path();
         let relative = path
             .strip_prefix(&root)
@@ -165,7 +290,7 @@ fn analyze_folder(
                 .as_ref()
                 .map_or(0, |text| text.chars().count()),
         );
-        let (category, confidence, explanation) = classify(relative, &ext, &sort);
+        let (category, confidence, explanation) = classify(relative, &ext, sort);
         let date = metadata
             .modified()
             .ok()
@@ -206,21 +331,25 @@ fn analyze_folder(
     if sort.mode == "custom" && sort.custom_prompt.trim().is_empty() {
         warnings.push("Кастомный режим без инструкции использовал стандартные категории.".into());
     }
-    let refinement = refine_with_model(&ai, &sort, &mut items, &contexts);
-    warnings.extend(refinement.warnings);
-    if !sort.unlimited && total_chars >= sort.total_limit {
-        warnings.push(
-            "Достигнут общий лимит текста. Часть файлов будет оценена по имени и метаданным."
-                .into(),
-        );
-    }
-    Ok(AnalysisResult {
-        total_files: items.len(),
-        estimated_chars: total_chars,
+    Ok(PreparedAnalysis {
         items,
+        contexts,
+        total_chars,
         warnings,
-        summary: refinement.summary,
     })
+}
+
+#[tauri::command]
+fn cancel_analysis(control: tauri::State<'_, AnalysisControl>) -> bool {
+    let running = control.running.load(Ordering::Acquire);
+    if running {
+        control.cancelled.store(true, Ordering::Release);
+    }
+    running
+}
+
+fn emit_progress(app: &tauri::AppHandle, progress: AnalysisProgress) {
+    let _ = app.emit("analysis-progress", progress);
 }
 
 #[tauri::command]
@@ -282,23 +411,32 @@ fn undo_last_sort(folder: String) -> Result<usize, String> {
 }
 
 #[tauri::command]
-fn test_connection(ai: AiSettings) -> Result<String, String> {
+async fn test_connection(ai: AiSettings) -> Result<String, String> {
     if ai.base_url.trim().is_empty() {
         return Err("Укажите базовый URL".into());
     }
     let url = format!("{}/models", ai.base_url.trim_end_matches('/'));
-    let mut request = ureq::get(&url).timeout(std::time::Duration::from_secs(8));
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(8))
+        .build()
+        .map_err(|error| format!("Не удалось создать HTTP-клиент: {error}"))?;
+    let mut request = client.get(&url);
     if !ai.api_key.trim().is_empty() {
-        request = request.set("Authorization", &format!("Bearer {}", ai.api_key));
+        request = request.bearer_auth(&ai.api_key);
     }
-    request
-        .call()
-        .map(|_| format!("Подключение успешно: {}", ai.base_url))
-        .map_err(|e| format!("Сервис не ответил: {e}"))
+    let response = tokio::time::timeout(Duration::from_secs(8), request.send())
+        .await
+        .map_err(|_| "Сервис не ответил за 8 секунд".to_string())?
+        .map_err(|error| format!("Сервис не ответил: {error}"))?;
+    response
+        .error_for_status()
+        .map_err(|error| format!("Сервис вернул ошибку: {error}"))?;
+    Ok(format!("Подключение успешно: {}", ai.base_url))
 }
 
 #[tauri::command]
-fn list_models(ai: AiSettings) -> Result<ModelList, String> {
+async fn list_models(ai: AiSettings) -> Result<ModelList, String> {
     if ai.base_url.trim().is_empty() {
         return Err("Укажите базовый URL".into());
     }
@@ -315,15 +453,25 @@ fn list_models(ai: AiSettings) -> Result<ModelList, String> {
     } else {
         format!("{}/models", ai.base_url.trim_end_matches('/'))
     };
-    let mut request = ureq::get(&url).timeout(std::time::Duration::from_secs(12));
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|error| format!("Не удалось создать HTTP-клиент: {error}"))?;
+    let mut request = client.get(&url);
     if !ai.api_key.trim().is_empty() {
-        request = request.set("Authorization", &format!("Bearer {}", ai.api_key));
+        request = request.bearer_auth(&ai.api_key);
     }
-    let value: serde_json::Value = request
-        .call()
-        .map_err(|e| format!("Не удалось получить модели: {e}"))?
-        .into_json()
-        .map_err(|e| e.to_string())?;
+    let response = tokio::time::timeout(Duration::from_secs(12), request.send())
+        .await
+        .map_err(|_| "Список моделей не получен за 12 секунд".to_string())?
+        .map_err(|error| format!("Не удалось получить модели: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("Сервис вернул ошибку: {error}"))?;
+    let value: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| format!("Список моделей не является JSON: {error}"))?;
     let source = if ai.provider == "lmstudio" || ai.provider == "ollama" {
         value.get("models").and_then(|v| v.as_array())
     } else {
@@ -644,42 +792,96 @@ struct AiRefinement {
     warnings: Vec<String>,
 }
 
-fn refine_with_model(
+#[derive(Debug)]
+enum BatchError {
+    Failure(String),
+    Cancelled,
+}
+
+async fn refine_with_model<P>(
+    client: &reqwest::Client,
     ai: &AiSettings,
     sort: &SortSettings,
     items: &mut [PlanItem],
     contexts: &[AiFileContext],
-) -> AiRefinement {
-    refine_in_batches(sort, items, contexts, |batch| {
-        request_model_batch(ai, sort, batch)
-    })
+    cancelled: Arc<AtomicBool>,
+    progress: P,
+) -> Result<AiRefinement, String>
+where
+    P: FnMut(AnalysisProgress),
+{
+    let request_cancelled = cancelled.clone();
+    refine_in_batches(
+        sort,
+        items,
+        contexts,
+        move |batch| {
+            request_model_batch(
+                client,
+                ai,
+                sort,
+                batch,
+                request_cancelled.clone(),
+                AI_BATCH_TIMEOUT,
+            )
+        },
+        progress,
+    )
+    .await
 }
 
-fn request_model_batch(
+async fn request_model_batch(
+    client: &reqwest::Client,
     ai: &AiSettings,
     sort: &SortSettings,
-    batch: &[AiFileContext],
-) -> Result<Vec<AiDecision>, String> {
+    batch: Vec<AiFileContext>,
+    cancelled: Arc<AtomicBool>,
+    hard_timeout: Duration,
+) -> Result<Vec<AiDecision>, BatchError> {
+    if cancelled.load(Ordering::Acquire) {
+        return Err(BatchError::Cancelled);
+    }
     let instruction = if sort.mode == "custom" {
         sort.custom_prompt.as_str()
     } else {
         "Используй только категории: Работа, Личное, Финансы, Учёба, Медиа, Архив, Загрузчики, Прочее. Установочные файлы с расширениями DMG, EXE, PKG, MSI и похожими всегда относятся к Загрузчикам."
     };
     let url = format!("{}/chat/completions", ai.base_url.trim_end_matches('/'));
-    let prompt = format!("Классифицируй только этот небольшой пакет файлов. Инструкция: {instruction}\nДля каждого файла сначала используй contentExtract, если он есть. Если его нет, анализируй только метаданные: path, extension, sizeBytes, даты и suggestedCategory. Не выдумывай содержимое. Верни ТОЛЬКО JSON-массив объектов {{id, category, explanation, confidence}}. Верни ровно одно решение для каждого переданного id. category — короткое безопасное имя папки без / и \\.\nФайлы: {}", serde_json::to_string(batch).map_err(|e| e.to_string())?);
+    let prompt = format!("Классифицируй только этот небольшой пакет файлов. Инструкция: {instruction}\nДля каждого файла сначала используй contentExtract, если он есть. Если его нет, анализируй только метаданные: path, extension, sizeBytes, даты и suggestedCategory. Не выдумывай содержимое. Верни ТОЛЬКО JSON-массив объектов {{id, category, explanation, confidence}}. Верни ровно одно решение для каждого переданного id. category — короткое безопасное имя папки без / и \\.\nФайлы: {}", serde_json::to_string(&batch).map_err(|error| BatchError::Failure(error.to_string()))?);
     let body = serde_json::json!({"model":ai.model,"temperature":0,"messages":[{"role":"system","content":"Ты отвечаешь строго валидным JSON без Markdown."},{"role":"user","content":prompt}]});
-    let mut request = ureq::post(&url)
-        .timeout(std::time::Duration::from_secs(90))
-        .set("Content-Type", "application/json");
+    let mut request = client.post(&url).json(&body);
     if !ai.api_key.trim().is_empty() {
-        request = request.set("Authorization", &format!("Bearer {}", ai.api_key));
+        request = request.bearer_auth(&ai.api_key);
     }
-    let value: serde_json::Value = request
-        .send_json(body)
-        .map_err(|e| format!("Ошибка запроса к модели: {e}"))?
-        .into_json()
-        .map_err(|e| format!("Ответ API не является JSON: {e}"))?;
-    parse_model_response(&value)
+    let operation = async {
+        let response = request
+            .send()
+            .await
+            .map_err(|error| BatchError::Failure(format!("Ошибка запроса к модели: {error}")))?
+            .error_for_status()
+            .map_err(|error| BatchError::Failure(format!("Модель вернула ошибку HTTP: {error}")))?;
+        let value: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|error| BatchError::Failure(format!("Ответ API не является JSON: {error}")))?;
+        parse_model_response(&value).map_err(BatchError::Failure)
+    };
+
+    tokio::select! {
+        _ = wait_for_cancellation(cancelled) => Err(BatchError::Cancelled),
+        outcome = tokio::time::timeout(hard_timeout, operation) => {
+            outcome.map_err(|_| BatchError::Failure(format!(
+                "Тайм-аут пакета: модель не ответила за {} секунд",
+                hard_timeout.as_secs()
+            )))?
+        }
+    }
+}
+
+async fn wait_for_cancellation(cancelled: Arc<AtomicBool>) {
+    while !cancelled.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 fn parse_model_response(value: &serde_json::Value) -> Result<Vec<AiDecision>, String> {
@@ -700,23 +902,43 @@ fn parse_model_response(value: &serde_json::Value) -> Result<Vec<AiDecision>, St
     serde_json::from_str(json).map_err(|error| format!("Модель вернула невалидный JSON: {error}"))
 }
 
-fn refine_in_batches<F>(
+async fn refine_in_batches<F, Fut, P>(
     sort: &SortSettings,
     items: &mut [PlanItem],
     contexts: &[AiFileContext],
     mut request_batch: F,
-) -> AiRefinement
+    mut progress: P,
+) -> Result<AiRefinement, String>
 where
-    F: FnMut(&[AiFileContext]) -> Result<Vec<AiDecision>, String>,
+    F: FnMut(Vec<AiFileContext>) -> Fut,
+    Fut: Future<Output = Result<Vec<AiDecision>, BatchError>>,
+    P: FnMut(AnalysisProgress),
 {
     if items.is_empty() {
-        return AiRefinement::default();
+        progress(AnalysisProgress {
+            phase: "complete".into(),
+            completed_batches: 0,
+            total_batches: 0,
+            processed_files: 0,
+            pending_files: 0,
+            message: "В выбранной папке нет файлов для анализа.".into(),
+        });
+        return Ok(AiRefinement::default());
     }
     let mut result = AiRefinement::default();
     let mut first_failures = HashMap::<String, String>::new();
+    let main_batches = contexts.len().div_ceil(AI_BATCH_SIZE);
 
     for (index, batch) in contexts.chunks(AI_BATCH_SIZE).enumerate() {
-        match request_batch(batch) {
+        progress(AnalysisProgress {
+            phase: "main".into(),
+            completed_batches: index,
+            total_batches: main_batches,
+            processed_files: processed_count(items),
+            pending_files: retry_pending_count(items),
+            message: format!("Основной проход: пакет {} из {main_batches}…", index + 1),
+        });
+        match request_batch(batch.to_vec()).await {
             Ok(decisions) => {
                 let missing = apply_batch_decisions(sort, items, batch, decisions);
                 if !missing.is_empty() {
@@ -728,13 +950,25 @@ where
                     result.warnings.push(format!("Основной проход, пакет {}: модель не вернула решения для {} файлов; они отправлены на повторную попытку.", index + 1, missing.len()));
                 }
             }
-            Err(error) => {
+            Err(BatchError::Failure(error)) => {
                 for context in batch {
                     first_failures.insert(context.id.clone(), error.clone());
                 }
                 result.warnings.push(format!("Основной проход, пакет {}: {error}. На повторную попытку отправлено {} файлов.", index + 1, batch.len()));
             }
+            Err(BatchError::Cancelled) => return Err("Анализ отменён пользователем".into()),
         }
+        progress(AnalysisProgress {
+            phase: "main".into(),
+            completed_batches: index + 1,
+            total_batches: main_batches,
+            processed_files: processed_count(items),
+            pending_files: retry_pending_count(items),
+            message: format!(
+                "Основной проход: завершено пакетов {} из {main_batches}.",
+                index + 1
+            ),
+        });
     }
 
     let retry_contexts: Vec<AiFileContext> = contexts
@@ -742,8 +976,17 @@ where
         .filter(|context| item_status(items, &context.id) == Some(AiStatus::RetryPending))
         .cloned()
         .collect();
+    let retry_batches = retry_contexts.len().div_ceil(AI_BATCH_SIZE);
     for (index, batch) in retry_contexts.chunks(AI_BATCH_SIZE).enumerate() {
-        match request_batch(batch) {
+        progress(AnalysisProgress {
+            phase: "retry".into(),
+            completed_batches: index,
+            total_batches: retry_batches,
+            processed_files: processed_count(items),
+            pending_files: retry_pending_count(items),
+            message: format!("Повторный проход: пакет {} из {retry_batches}…", index + 1),
+        });
+        match request_batch(batch.to_vec()).await {
             Ok(decisions) => {
                 let missing = apply_batch_decisions(sort, items, batch, decisions);
                 result.summary.retry_succeeded += batch.len() - missing.len();
@@ -756,7 +999,7 @@ where
                     result.warnings.push(format!("Повторный проход, пакет {}: для {} файлов снова нет решения; они направлены в «{}».", index + 1, missing.len(), UNPROCESSED_CATEGORY));
                 }
             }
-            Err(error) => {
+            Err(BatchError::Failure(error)) => {
                 for context in batch {
                     mark_unprocessed(items, &context.id, first_failures.get(&context.id), &error);
                 }
@@ -767,7 +1010,19 @@ where
                     batch.len()
                 ));
             }
+            Err(BatchError::Cancelled) => return Err("Анализ отменён пользователем".into()),
         }
+        progress(AnalysisProgress {
+            phase: "retry".into(),
+            completed_batches: index + 1,
+            total_batches: retry_batches,
+            processed_files: processed_count(items),
+            pending_files: retry_pending_count(items),
+            message: format!(
+                "Повторный проход: завершено пакетов {} из {retry_batches}.",
+                index + 1
+            ),
+        });
     }
 
     result.summary.ai_processed = items
@@ -778,7 +1033,34 @@ where
         .iter()
         .filter(|item| item.ai_status == AiStatus::Unprocessed)
         .count();
-    result
+    progress(AnalysisProgress {
+        phase: "complete".into(),
+        completed_batches: main_batches + retry_batches,
+        total_batches: main_batches + retry_batches,
+        processed_files: result.summary.ai_processed,
+        pending_files: 0,
+        message: format!(
+            "Анализ завершён: ИИ обработал {}, после повтора — {}, не обработано — {}.",
+            result.summary.ai_processed,
+            result.summary.retry_succeeded,
+            result.summary.ai_unprocessed
+        ),
+    });
+    Ok(result)
+}
+
+fn processed_count(items: &[PlanItem]) -> usize {
+    items
+        .iter()
+        .filter(|item| item.ai_status == AiStatus::Processed)
+        .count()
+}
+
+fn retry_pending_count(items: &[PlanItem]) -> usize {
+    items
+        .iter()
+        .filter(|item| item.ai_status == AiStatus::RetryPending)
+        .count()
 }
 
 fn item_status(items: &[PlanItem], id: &str) -> Option<AiStatus> {
@@ -867,9 +1149,11 @@ fn retarget_item(item: &mut PlanItem, category: &str) {
 
 pub fn run() {
     tauri::Builder::default()
+        .manage(AnalysisControl::default())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             analyze_folder,
+            cancel_analysis,
             apply_sort,
             undo_last_sort,
             test_connection,
@@ -939,14 +1223,22 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn all_batches_are_processed_successfully() {
+    #[tokio::test]
+    async fn all_batches_are_processed_successfully() {
         let (mut items, contexts) = plan(23);
         let mut calls = 0;
-        let result = refine_in_batches(&test_sort(), &mut items, &contexts, |batch| {
-            calls += 1;
-            Ok(decisions(batch))
-        });
+        let result = refine_in_batches(
+            &test_sort(),
+            &mut items,
+            &contexts,
+            |batch| {
+                calls += 1;
+                std::future::ready(Ok(decisions(&batch)))
+            },
+            |_| {},
+        )
+        .await
+        .unwrap();
         assert_eq!(calls, 3);
         assert_eq!(
             result.summary,
@@ -961,18 +1253,27 @@ mod tests {
             .all(|item| item.ai_status == AiStatus::Processed));
     }
 
-    #[test]
-    fn failed_batch_does_not_stop_following_batches() {
+    #[tokio::test]
+    async fn failed_batch_does_not_stop_following_batches() {
         let (mut items, contexts) = plan(23);
         let mut calls = 0;
-        let result = refine_in_batches(&test_sort(), &mut items, &contexts, |batch| {
-            calls += 1;
-            if calls == 2 {
-                Err("Тайм-аут основного пакета".into())
-            } else {
-                Ok(decisions(batch))
-            }
-        });
+        let result = refine_in_batches(
+            &test_sort(),
+            &mut items,
+            &contexts,
+            |batch| {
+                calls += 1;
+                let response = if calls == 2 {
+                    Err(BatchError::Failure("Тайм-аут основного пакета".into()))
+                } else {
+                    Ok(decisions(&batch))
+                };
+                std::future::ready(response)
+            },
+            |_| {},
+        )
+        .await
+        .unwrap();
         assert_eq!(calls, 4);
         assert_eq!(
             result.summary,
@@ -986,18 +1287,27 @@ mod tests {
         assert_eq!(items[10].ai_status, AiStatus::Processed);
     }
 
-    #[test]
-    fn second_failure_moves_only_failed_files_to_unprocessed() {
+    #[tokio::test]
+    async fn second_failure_moves_only_failed_files_to_unprocessed() {
         let (mut items, contexts) = plan(15);
         let mut calls = 0;
-        let result = refine_in_batches(&test_sort(), &mut items, &contexts, |batch| {
-            calls += 1;
-            match calls {
-                1 => Ok(decisions(batch)),
-                2 => Err("Тайм-аут запроса".into()),
-                _ => Err("Модель вернула невалидный JSON".into()),
-            }
-        });
+        let result = refine_in_batches(
+            &test_sort(),
+            &mut items,
+            &contexts,
+            |batch| {
+                calls += 1;
+                let response = match calls {
+                    1 => Ok(decisions(&batch)),
+                    2 => Err(BatchError::Failure("Тайм-аут запроса".into())),
+                    _ => Err(BatchError::Failure("Модель вернула невалидный JSON".into())),
+                };
+                std::future::ready(response)
+            },
+            |_| {},
+        )
+        .await
+        .unwrap();
         assert_eq!(
             result.summary,
             AiSummary {
@@ -1022,18 +1332,27 @@ mod tests {
         }
     }
 
-    #[test]
-    fn missing_partial_decisions_are_retried() {
+    #[tokio::test]
+    async fn missing_partial_decisions_are_retried() {
         let (mut items, contexts) = plan(12);
         let mut calls = 0;
-        let result = refine_in_batches(&test_sort(), &mut items, &contexts, |batch| {
-            calls += 1;
-            if calls == 1 {
-                Ok(decisions(&batch[..8]))
-            } else {
-                Ok(decisions(batch))
-            }
-        });
+        let result = refine_in_batches(
+            &test_sort(),
+            &mut items,
+            &contexts,
+            |batch| {
+                calls += 1;
+                let response = if calls == 1 {
+                    Ok(decisions(&batch[..8]))
+                } else {
+                    Ok(decisions(&batch))
+                };
+                std::future::ready(response)
+            },
+            |_| {},
+        )
+        .await
+        .unwrap();
         assert_eq!(calls, 3);
         assert_eq!(
             result.summary,
@@ -1056,6 +1375,106 @@ mod tests {
         assert!(parse_model_response(&value)
             .unwrap_err()
             .contains("невалидный JSON"));
+    }
+
+    #[tokio::test]
+    async fn hanging_server_is_stopped_by_the_hard_batch_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .connect_timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let ai = AiSettings {
+            provider: "compatible".into(),
+            base_url: format!("http://{address}"),
+            model: "test".into(),
+            api_key: String::new(),
+            cloud_consent: true,
+        };
+        let (_, contexts) = plan(1);
+        let started = std::time::Instant::now();
+        let result = request_model_batch(
+            &client,
+            &ai,
+            &test_sort(),
+            contexts,
+            Arc::new(AtomicBool::new(false)),
+            Duration::from_millis(100),
+        )
+        .await;
+        server.abort();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        match result {
+            Err(BatchError::Failure(error)) => assert!(error.contains("Тайм-аут пакета")),
+            _ => panic!("ожидалась техническая ошибка жёсткого тайм-аута"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_stops_a_batch_before_the_request() {
+        let client = reqwest::Client::new();
+        let ai = AiSettings {
+            provider: "compatible".into(),
+            base_url: "http://127.0.0.1:9".into(),
+            model: "test".into(),
+            api_key: String::new(),
+            cloud_consent: true,
+        };
+        let (_, contexts) = plan(1);
+        let result = request_model_batch(
+            &client,
+            &ai,
+            &test_sort(),
+            contexts,
+            Arc::new(AtomicBool::new(true)),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(matches!(result, Err(BatchError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_an_in_flight_request() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let ai = AiSettings {
+            provider: "compatible".into(),
+            base_url: format!("http://{address}"),
+            model: "test".into(),
+            api_key: String::new(),
+            cloud_consent: true,
+        };
+        let (_, contexts) = plan(1);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancellation_signal = cancelled.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancellation_signal.store(true, Ordering::Release);
+        });
+        let started = std::time::Instant::now();
+        let result = request_model_batch(
+            &client,
+            &ai,
+            &test_sort(),
+            contexts,
+            cancelled,
+            Duration::from_secs(5),
+        )
+        .await;
+        server.abort();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(matches!(result, Err(BatchError::Cancelled)));
     }
 
     #[test]
