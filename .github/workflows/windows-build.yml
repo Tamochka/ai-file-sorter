@@ -49,6 +49,15 @@ jobs:
       - name: Build NSIS installer
         run: npm run tauri build -- --bundles nsis
 
+      - name: Verify Windows GUI executable
+        shell: pwsh
+        run: |
+          $binary = "src-tauri/target/release/ai-file-sorter.exe"
+          $bytes = [IO.File]::ReadAllBytes($binary)
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+          $subsystem = [BitConverter]::ToUInt16($bytes, $peOffset + 24 + 68)
+          if ($subsystem -ne 2) { throw "Expected Windows GUI subsystem (2), found $subsystem" }
+
       - name: Create SHA-256 checksum
         shell: pwsh
         run: |
