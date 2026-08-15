@@ -55,7 +55,12 @@ jobs:
           $installer = Get-ChildItem "src-tauri/target/release/bundle/nsis/*-setup.exe" | Select-Object -First 1
           if (-not $installer) { throw "NSIS installer was not produced" }
           $hash = (Get-FileHash $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  $($installer.Name)" | Set-Content "src-tauri/target/release/bundle/nsis/SHA256SUMS.txt"
+          $checksum = "$hash  $($installer.Name)`n"
+          [IO.File]::WriteAllText(
+            "src-tauri/target/release/bundle/nsis/SHA256SUMS.txt",
+            $checksum,
+            [Text.UTF8Encoding]::new($false)
+          )
 
       - name: Upload Windows application
         uses: actions/upload-artifact@v7
