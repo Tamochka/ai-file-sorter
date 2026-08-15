@@ -1852,9 +1852,10 @@ mod tests {
         for item in &items[10..] {
             assert_eq!(item.ai_status, AiStatus::Unprocessed);
             assert_eq!(item.category, UNPROCESSED_CATEGORY);
-            assert!(item
-                .target
-                .starts_with("AI Sorted/Не обработано ИИ/Текст/2026/08/исходная/папка/"));
+            let expected_parent = PathBuf::from(SORTED_DIR)
+                .join(UNPROCESSED_CATEGORY)
+                .join("Текст/2026/08/исходная/папка");
+            assert!(Path::new(&item.target).starts_with(expected_parent));
             assert!(item.included);
             let error = item.ai_error.as_deref().unwrap();
             assert!(error.contains("Тайм-аут запроса"));
