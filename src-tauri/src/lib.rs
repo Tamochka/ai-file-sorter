@@ -1,7 +1,7 @@
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     future::Future,
     path::{Component, Path, PathBuf},
@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tauri::Emitter;
 use uuid::Uuid;
@@ -112,7 +112,34 @@ struct AnalysisProgress {
     total_batches: usize,
     processed_files: usize,
     pending_files: usize,
+    not_attempted_files: usize,
+    retry_pending_files: usize,
     message: String,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ExtensionCount {
+    extension: String,
+    count: usize,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct AnalysisLogEvent {
+    phase: String,
+    attempt: Option<usize>,
+    batch_number: Option<usize>,
+    total_batches: Option<usize>,
+    file_count: usize,
+    extensions: Vec<ExtensionCount>,
+    duration_ms: u64,
+    outcome: String,
+    successful_files: usize,
+    unresolved_files: usize,
+    skipped_files: usize,
+    error_kind: Option<String>,
+    error_detail: Option<String>,
 }
 
 #[derive(Default)]
@@ -134,6 +161,7 @@ struct PreparedAnalysis {
     contexts: Vec<AiFileContext>,
     total_chars: usize,
     warnings: Vec<String>,
+    inaccessible_files: usize,
 }
 
 const SORTED_DIR: &str = "AI Sorted";
@@ -180,10 +208,13 @@ async fn analyze_folder(
             total_batches: 0,
             processed_files: 0,
             pending_files: 0,
+            not_attempted_files: 0,
+            retry_pending_files: 0,
             message: "Сканирование файлов…".into(),
         },
     );
 
+    let scan_started = Instant::now();
     let scan_cancelled = cancelled.clone();
     let scan_sort = sort.clone();
     let prepared = tauri::async_runtime::spawn_blocking(move || {
@@ -207,8 +238,28 @@ async fn analyze_folder(
         contexts,
         total_chars,
         mut warnings,
+        inaccessible_files,
     } = prepared;
+    emit_analysis_log(
+        &app,
+        AnalysisLogEvent {
+            phase: "scanning".into(),
+            attempt: None,
+            batch_number: None,
+            total_batches: None,
+            file_count: contexts.len(),
+            extensions: extension_summary(&contexts),
+            duration_ms: elapsed_ms(scan_started),
+            outcome: "success".into(),
+            successful_files: contexts.len(),
+            unresolved_files: 0,
+            skipped_files: inaccessible_files,
+            error_kind: None,
+            error_detail: None,
+        },
+    );
     let progress_app = app.clone();
+    let log_app = app.clone();
     let refinement = refine_with_model(
         &client,
         &ai,
@@ -216,7 +267,10 @@ async fn analyze_folder(
         &mut items,
         &contexts,
         cancelled,
-        move |progress| emit_progress(&progress_app, progress),
+        (
+            move |progress| emit_progress(&progress_app, progress),
+            move |event| emit_analysis_log(&log_app, event),
+        ),
     )
     .await?;
     warnings.extend(refinement.warnings);
@@ -245,6 +299,7 @@ fn prepare_analysis(
     let mut items = Vec::new();
     let mut contexts = Vec::new();
     let mut warnings = Vec::new();
+    let mut inaccessible_files = 0usize;
     for entry in WalkDir::new(&root)
         .into_iter()
         .filter_entry(scan_entry)
@@ -264,7 +319,7 @@ fn prepare_analysis(
         let metadata = match fs::metadata(path) {
             Ok(data) => data,
             Err(_) => {
-                warnings.push(format!("Нет доступа к {}", relative.display()));
+                inaccessible_files += 1;
                 continue;
             }
         };
@@ -331,11 +386,17 @@ fn prepare_analysis(
     if sort.mode == "custom" && sort.custom_prompt.trim().is_empty() {
         warnings.push("Кастомный режим без инструкции использовал стандартные категории.".into());
     }
+    if inaccessible_files > 0 {
+        warnings.push(format!(
+            "Нет доступа к {inaccessible_files} файлам; их имена и пути скрыты."
+        ));
+    }
     Ok(PreparedAnalysis {
         items,
         contexts,
         total_chars,
         warnings,
+        inaccessible_files,
     })
 }
 
@@ -350,6 +411,87 @@ fn cancel_analysis(control: tauri::State<'_, AnalysisControl>) -> bool {
 
 fn emit_progress(app: &tauri::AppHandle, progress: AnalysisProgress) {
     let _ = app.emit("analysis-progress", progress);
+}
+
+fn emit_analysis_log(app: &tauri::AppHandle, event: AnalysisLogEvent) {
+    let _ = app.emit("analysis-log", event);
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn extension_summary(contexts: &[AiFileContext]) -> Vec<ExtensionCount> {
+    const MAX_EXTENSIONS: usize = 12;
+    let mut counts = BTreeMap::<String, usize>::new();
+    for context in contexts {
+        let extension = if context.extension.trim().is_empty() {
+            "без расширения".to_string()
+        } else {
+            format!(".{}", context.extension.trim().to_lowercase())
+        };
+        *counts.entry(extension).or_default() += 1;
+    }
+    let mut summary: Vec<ExtensionCount> = counts
+        .into_iter()
+        .map(|(extension, count)| ExtensionCount { extension, count })
+        .collect();
+    summary.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.extension.cmp(&right.extension))
+    });
+    if summary.len() > MAX_EXTENSIONS {
+        let other_count = summary[MAX_EXTENSIONS..]
+            .iter()
+            .map(|entry| entry.count)
+            .sum();
+        summary.truncate(MAX_EXTENSIONS);
+        summary.push(ExtensionCount {
+            extension: "другие".into(),
+            count: other_count,
+        });
+    }
+    summary
+}
+
+fn anonymized_error(error: &str) -> (String, String) {
+    let (kind, fallback) = if error.contains("Тайм-аут") || error.contains("timed out") {
+        ("timeout", "Модель не ответила в установленное время")
+    } else if error.contains("невалидный JSON") || error.contains("не является JSON")
+    {
+        ("invalid_json", "Ответ модели не является валидным JSON")
+    } else if error.contains("HTTP") {
+        ("http", "API модели вернул ошибку HTTP")
+    } else if error.contains("choices[0].message.content") {
+        (
+            "response_shape",
+            "В ответе модели отсутствует ожидаемое поле",
+        )
+    } else if error.contains("запрос") || error.contains("request") {
+        ("network", "Сетевая ошибка запроса к модели")
+    } else {
+        ("unknown", "Неизвестная техническая ошибка модели")
+    };
+    let mut detail = error.trim().to_string();
+    for marker in [" for url", "http://", "https://", "file://"] {
+        if let Some(index) = detail.find(marker) {
+            detail.truncate(index);
+        }
+    }
+    if detail.contains("/Users/")
+        || detail.contains("/Volumes/")
+        || detail.contains("\\Users\\")
+        || detail.is_empty()
+    {
+        detail = fallback.into();
+    }
+    detail = detail.trim_end_matches([' ', ':', '(', '-']).to_string();
+    if detail.chars().count() > 240 {
+        detail = detail.chars().take(237).collect::<String>() + "…";
+    }
+    (kind.into(), detail)
 }
 
 #[tauri::command]
@@ -428,11 +570,11 @@ async fn test_connection(ai: AiSettings) -> Result<String, String> {
     let response = tokio::time::timeout(Duration::from_secs(8), request.send())
         .await
         .map_err(|_| "Сервис не ответил за 8 секунд".to_string())?
-        .map_err(|error| format!("Сервис не ответил: {error}"))?;
+        .map_err(|error| anonymized_error(&format!("Сервис не ответил: {error}")).1)?;
     response
         .error_for_status()
-        .map_err(|error| format!("Сервис вернул ошибку: {error}"))?;
-    Ok(format!("Подключение успешно: {}", ai.base_url))
+        .map_err(|error| anonymized_error(&format!("Сервис вернул ошибку HTTP: {error}")).1)?;
+    Ok("Подключение успешно".into())
 }
 
 #[tauri::command]
@@ -465,9 +607,9 @@ async fn list_models(ai: AiSettings) -> Result<ModelList, String> {
     let response = tokio::time::timeout(Duration::from_secs(12), request.send())
         .await
         .map_err(|_| "Список моделей не получен за 12 секунд".to_string())?
-        .map_err(|error| format!("Не удалось получить модели: {error}"))?
+        .map_err(|error| anonymized_error(&format!("Не удалось получить модели: {error}")).1)?
         .error_for_status()
-        .map_err(|error| format!("Сервис вернул ошибку: {error}"))?;
+        .map_err(|error| anonymized_error(&format!("Сервис вернул ошибку HTTP: {error}")).1)?;
     let value: serde_json::Value = response
         .json()
         .await
@@ -798,18 +940,20 @@ enum BatchError {
     Cancelled,
 }
 
-async fn refine_with_model<P>(
+async fn refine_with_model<P, L>(
     client: &reqwest::Client,
     ai: &AiSettings,
     sort: &SortSettings,
     items: &mut [PlanItem],
     contexts: &[AiFileContext],
     cancelled: Arc<AtomicBool>,
-    progress: P,
+    observers: (P, L),
 ) -> Result<AiRefinement, String>
 where
     P: FnMut(AnalysisProgress),
+    L: FnMut(AnalysisLogEvent),
 {
+    let (progress, log_event) = observers;
     let request_cancelled = cancelled.clone();
     refine_in_batches(
         sort,
@@ -826,6 +970,7 @@ where
             )
         },
         progress,
+        log_event,
     )
     .await
 }
@@ -902,17 +1047,50 @@ fn parse_model_response(value: &serde_json::Value) -> Result<Vec<AiDecision>, St
     serde_json::from_str(json).map_err(|error| format!("Модель вернула невалидный JSON: {error}"))
 }
 
-async fn refine_in_batches<F, Fut, P>(
+#[allow(clippy::too_many_arguments)]
+fn batch_log_event(
+    phase: &str,
+    attempt: usize,
+    batch_number: usize,
+    total_batches: usize,
+    batch: &[AiFileContext],
+    started: Instant,
+    outcome: &str,
+    successful_files: usize,
+    unresolved_files: usize,
+    error_kind: Option<String>,
+    error_detail: Option<String>,
+) -> AnalysisLogEvent {
+    AnalysisLogEvent {
+        phase: phase.into(),
+        attempt: Some(attempt),
+        batch_number: Some(batch_number),
+        total_batches: Some(total_batches),
+        file_count: batch.len(),
+        extensions: extension_summary(batch),
+        duration_ms: elapsed_ms(started),
+        outcome: outcome.into(),
+        successful_files,
+        unresolved_files,
+        skipped_files: 0,
+        error_kind,
+        error_detail,
+    }
+}
+
+async fn refine_in_batches<F, Fut, P, L>(
     sort: &SortSettings,
     items: &mut [PlanItem],
     contexts: &[AiFileContext],
     mut request_batch: F,
     mut progress: P,
+    mut log_event: L,
 ) -> Result<AiRefinement, String>
 where
     F: FnMut(Vec<AiFileContext>) -> Fut,
     Fut: Future<Output = Result<Vec<AiDecision>, BatchError>>,
     P: FnMut(AnalysisProgress),
+    L: FnMut(AnalysisLogEvent),
 {
     if items.is_empty() {
         progress(AnalysisProgress {
@@ -921,6 +1099,8 @@ where
             total_batches: 0,
             processed_files: 0,
             pending_files: 0,
+            not_attempted_files: 0,
+            retry_pending_files: 0,
             message: "В выбранной папке нет файлов для анализа.".into(),
         });
         return Ok(AiRefinement::default());
@@ -930,17 +1110,22 @@ where
     let main_batches = contexts.len().div_ceil(AI_BATCH_SIZE);
 
     for (index, batch) in contexts.chunks(AI_BATCH_SIZE).enumerate() {
+        let not_attempted_before = contexts.len().saturating_sub(index * AI_BATCH_SIZE);
         progress(AnalysisProgress {
             phase: "main".into(),
             completed_batches: index,
             total_batches: main_batches,
             processed_files: processed_count(items),
-            pending_files: retry_pending_count(items),
+            pending_files: not_attempted_before + first_failures.len(),
+            not_attempted_files: not_attempted_before,
+            retry_pending_files: first_failures.len(),
             message: format!("Основной проход: пакет {} из {main_batches}…", index + 1),
         });
+        let batch_started = Instant::now();
         match request_batch(batch.to_vec()).await {
             Ok(decisions) => {
                 let missing = apply_batch_decisions(sort, items, batch, decisions);
+                let successful = batch.len() - missing.len();
                 if !missing.is_empty() {
                     let reason = "Модель вернула частичный ответ: решение для файла отсутствует."
                         .to_string();
@@ -949,21 +1134,73 @@ where
                     }
                     result.warnings.push(format!("Основной проход, пакет {}: модель не вернула решения для {} файлов; они отправлены на повторную попытку.", index + 1, missing.len()));
                 }
+                log_event(batch_log_event(
+                    "main",
+                    1,
+                    index + 1,
+                    main_batches,
+                    batch,
+                    batch_started,
+                    if missing.is_empty() {
+                        "success"
+                    } else {
+                        "partial"
+                    },
+                    successful,
+                    missing.len(),
+                    (!missing.is_empty()).then(|| "partial_response".into()),
+                    (!missing.is_empty())
+                        .then(|| "Модель не вернула решения для части файлов пакета".into()),
+                ));
             }
             Err(BatchError::Failure(error)) => {
+                let (error_kind, error_detail) = anonymized_error(&error);
                 for context in batch {
-                    first_failures.insert(context.id.clone(), error.clone());
+                    first_failures.insert(context.id.clone(), error_detail.clone());
                 }
-                result.warnings.push(format!("Основной проход, пакет {}: {error}. На повторную попытку отправлено {} файлов.", index + 1, batch.len()));
+                result.warnings.push(format!("Основной проход, пакет {}: {error_detail}. На повторную попытку отправлено {} файлов.", index + 1, batch.len()));
+                log_event(batch_log_event(
+                    "main",
+                    1,
+                    index + 1,
+                    main_batches,
+                    batch,
+                    batch_started,
+                    "error",
+                    0,
+                    batch.len(),
+                    Some(error_kind),
+                    Some(error_detail),
+                ));
             }
-            Err(BatchError::Cancelled) => return Err("Анализ отменён пользователем".into()),
+            Err(BatchError::Cancelled) => {
+                log_event(batch_log_event(
+                    "main",
+                    1,
+                    index + 1,
+                    main_batches,
+                    batch,
+                    batch_started,
+                    "cancelled",
+                    0,
+                    batch.len(),
+                    Some("cancelled".into()),
+                    Some("Анализ отменён пользователем".into()),
+                ));
+                return Err("Анализ отменён пользователем".into());
+            }
         }
+        let not_attempted_after = contexts
+            .len()
+            .saturating_sub(((index + 1) * AI_BATCH_SIZE).min(contexts.len()));
         progress(AnalysisProgress {
             phase: "main".into(),
             completed_batches: index + 1,
             total_batches: main_batches,
             processed_files: processed_count(items),
-            pending_files: retry_pending_count(items),
+            pending_files: not_attempted_after + first_failures.len(),
+            not_attempted_files: not_attempted_after,
+            retry_pending_files: first_failures.len(),
             message: format!(
                 "Основной проход: завершено пакетов {} из {main_batches}.",
                 index + 1
@@ -984,12 +1221,16 @@ where
             total_batches: retry_batches,
             processed_files: processed_count(items),
             pending_files: retry_pending_count(items),
+            not_attempted_files: 0,
+            retry_pending_files: retry_pending_count(items),
             message: format!("Повторный проход: пакет {} из {retry_batches}…", index + 1),
         });
+        let batch_started = Instant::now();
         match request_batch(batch.to_vec()).await {
             Ok(decisions) => {
                 let missing = apply_batch_decisions(sort, items, batch, decisions);
-                result.summary.retry_succeeded += batch.len() - missing.len();
+                let successful = batch.len() - missing.len();
+                result.summary.retry_succeeded += successful;
                 if !missing.is_empty() {
                     let reason =
                         "Модель снова вернула частичный ответ: решение для файла отсутствует.";
@@ -998,19 +1239,72 @@ where
                     }
                     result.warnings.push(format!("Повторный проход, пакет {}: для {} файлов снова нет решения; они направлены в «{}».", index + 1, missing.len(), UNPROCESSED_CATEGORY));
                 }
+                log_event(batch_log_event(
+                    "retry",
+                    2,
+                    index + 1,
+                    retry_batches,
+                    batch,
+                    batch_started,
+                    if missing.is_empty() {
+                        "success"
+                    } else {
+                        "partial"
+                    },
+                    successful,
+                    missing.len(),
+                    (!missing.is_empty()).then(|| "partial_response".into()),
+                    (!missing.is_empty()).then(|| {
+                        "Модель повторно не вернула решения для части файлов пакета".into()
+                    }),
+                ));
             }
             Err(BatchError::Failure(error)) => {
+                let (error_kind, error_detail) = anonymized_error(&error);
                 for context in batch {
-                    mark_unprocessed(items, &context.id, first_failures.get(&context.id), &error);
+                    mark_unprocessed(
+                        items,
+                        &context.id,
+                        first_failures.get(&context.id),
+                        &error_detail,
+                    );
                 }
                 result.warnings.push(format!(
-                    "Повторный проход, пакет {}: {error}. В «{}» направлено {} файлов.",
+                    "Повторный проход, пакет {}: {error_detail}. В «{}» направлено {} файлов.",
                     index + 1,
                     UNPROCESSED_CATEGORY,
                     batch.len()
                 ));
+                log_event(batch_log_event(
+                    "retry",
+                    2,
+                    index + 1,
+                    retry_batches,
+                    batch,
+                    batch_started,
+                    "error",
+                    0,
+                    batch.len(),
+                    Some(error_kind),
+                    Some(error_detail),
+                ));
             }
-            Err(BatchError::Cancelled) => return Err("Анализ отменён пользователем".into()),
+            Err(BatchError::Cancelled) => {
+                log_event(batch_log_event(
+                    "retry",
+                    2,
+                    index + 1,
+                    retry_batches,
+                    batch,
+                    batch_started,
+                    "cancelled",
+                    0,
+                    batch.len(),
+                    Some("cancelled".into()),
+                    Some("Анализ отменён пользователем".into()),
+                ));
+                return Err("Анализ отменён пользователем".into());
+            }
         }
         progress(AnalysisProgress {
             phase: "retry".into(),
@@ -1018,6 +1312,8 @@ where
             total_batches: retry_batches,
             processed_files: processed_count(items),
             pending_files: retry_pending_count(items),
+            not_attempted_files: 0,
+            retry_pending_files: retry_pending_count(items),
             message: format!(
                 "Повторный проход: завершено пакетов {} из {retry_batches}.",
                 index + 1
@@ -1039,6 +1335,8 @@ where
         total_batches: main_batches + retry_batches,
         processed_files: result.summary.ai_processed,
         pending_files: 0,
+        not_attempted_files: 0,
+        retry_pending_files: 0,
         message: format!(
             "Анализ завершён: ИИ обработал {}, после повтора — {}, не обработано — {}.",
             result.summary.ai_processed,
@@ -1236,6 +1534,7 @@ mod tests {
                 std::future::ready(Ok(decisions(&batch)))
             },
             |_| {},
+            |_| {},
         )
         .await
         .unwrap();
@@ -1271,6 +1570,7 @@ mod tests {
                 std::future::ready(response)
             },
             |_| {},
+            |_| {},
         )
         .await
         .unwrap();
@@ -1304,6 +1604,7 @@ mod tests {
                 };
                 std::future::ready(response)
             },
+            |_| {},
             |_| {},
         )
         .await
@@ -1350,6 +1651,7 @@ mod tests {
                 std::future::ready(response)
             },
             |_| {},
+            |_| {},
         )
         .await
         .unwrap();
@@ -1375,6 +1677,84 @@ mod tests {
         assert!(parse_model_response(&value)
             .unwrap_err()
             .contains("невалидный JSON"));
+    }
+
+    #[test]
+    fn diagnostic_errors_hide_urls_and_local_paths() {
+        let (_, url_detail) = anonymized_error(
+            "Модель вернула ошибку HTTP: 400 Bad Request for url (http://127.0.0.1:1234/v1/chat/completions)",
+        );
+        assert!(url_detail.contains("400 Bad Request"));
+        assert!(!url_detail.contains("http://"));
+
+        let (_, path_detail) =
+            anonymized_error("Ошибка запроса к модели: /Users/private/Documents/secret-file.txt");
+        assert_eq!(path_detail, "Сетевая ошибка запроса к модели");
+        assert!(!path_detail.contains("secret-file"));
+    }
+
+    #[test]
+    fn extension_summary_contains_no_file_names_or_paths() {
+        let (_, mut contexts) = plan(3);
+        contexts[0].extension = "PDF".into();
+        contexts[1].extension = "pdf".into();
+        contexts[2].extension.clear();
+        let summary = extension_summary(&contexts);
+        assert_eq!(
+            summary,
+            vec![
+                ExtensionCount {
+                    extension: ".pdf".into(),
+                    count: 2,
+                },
+                ExtensionCount {
+                    extension: "без расширения".into(),
+                    count: 1,
+                },
+            ]
+        );
+        let serialized = serde_json::to_string(&summary).unwrap();
+        assert!(!serialized.contains("исходная"));
+        assert!(!serialized.contains("file-"));
+    }
+
+    #[tokio::test]
+    async fn batch_diagnostics_report_attempts_extensions_and_separate_counts() {
+        let (mut items, mut contexts) = plan(12);
+        contexts[0].extension = "pdf".into();
+        contexts[1].extension = "pdf".into();
+        let mut progress_events = Vec::new();
+        let mut log_events = Vec::new();
+        refine_in_batches(
+            &test_sort(),
+            &mut items,
+            &contexts,
+            |batch| std::future::ready(Ok(decisions(&batch))),
+            |progress| progress_events.push(progress),
+            |event| log_events.push(event),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(log_events.len(), 2);
+        assert_eq!(log_events[0].attempt, Some(1));
+        assert_eq!(log_events[0].batch_number, Some(1));
+        assert_eq!(log_events[0].file_count, 10);
+        assert_eq!(log_events[0].outcome, "success");
+        assert_eq!(log_events[0].successful_files, 10);
+        assert!(log_events[0].extensions.contains(&ExtensionCount {
+            extension: ".pdf".into(),
+            count: 2,
+        }));
+
+        let after_first_batch = progress_events
+            .iter()
+            .find(|progress| progress.phase == "main" && progress.completed_batches == 1)
+            .unwrap();
+        assert_eq!(after_first_batch.processed_files, 10);
+        assert_eq!(after_first_batch.not_attempted_files, 2);
+        assert_eq!(after_first_batch.retry_pending_files, 0);
+        assert_eq!(after_first_batch.pending_files, 2);
     }
 
     #[tokio::test]
