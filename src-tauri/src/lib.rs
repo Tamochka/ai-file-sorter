@@ -2,8 +2,10 @@ use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fs,
+    fs::{self, OpenOptions},
     future::Future,
+    io::Read,
+    net::IpAddr,
     path::{Component, Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -76,6 +78,12 @@ struct AiSummary {
 struct MoveRecord {
     from: String,
     to: String,
+}
+
+#[derive(Debug, Clone)]
+struct PlannedMove {
+    from: PathBuf,
+    to: PathBuf,
 }
 #[derive(Debug, Deserialize)]
 struct AiDecision {
@@ -182,10 +190,7 @@ async fn analyze_folder(
     if ai.model.trim().is_empty() {
         return Err("Укажите имя модели".into());
     }
-    let is_local = ai.provider == "lmstudio"
-        || ai.provider == "ollama"
-        || ai.base_url.contains("localhost")
-        || ai.base_url.contains("127.0.0.1");
+    let is_local = is_loopback_endpoint(&ai.base_url);
     if !is_local && !ai.cloud_consent {
         return Err("Нужно подтвердить передачу данных в облако".into());
     }
@@ -300,14 +305,19 @@ fn prepare_analysis(
     let mut contexts = Vec::new();
     let mut warnings = Vec::new();
     let mut inaccessible_files = 0usize;
-    for entry in WalkDir::new(&root)
-        .into_iter()
-        .filter_entry(scan_entry)
-        .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_file())
-    {
+    for entry in WalkDir::new(&root).into_iter().filter_entry(scan_entry) {
         if cancelled.load(Ordering::Acquire) {
             return Err("Анализ отменён пользователем".into());
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                inaccessible_files += 1;
+                continue;
+            }
+        };
+        if !entry.file_type().is_file() {
+            continue;
         }
         let path = entry.path();
         let relative = path
@@ -388,7 +398,7 @@ fn prepare_analysis(
     }
     if inaccessible_files > 0 {
         warnings.push(format!(
-            "Нет доступа к {inaccessible_files} файлам; их имена и пути скрыты."
+            "Нет доступа к {inaccessible_files} объектам; их имена и пути скрыты."
         ));
     }
     Ok(PreparedAnalysis {
@@ -483,6 +493,10 @@ fn anonymized_error(error: &str) -> (String, String) {
     if detail.contains("/Users/")
         || detail.contains("/Volumes/")
         || detail.contains("\\Users\\")
+        || detail.contains("\\\\")
+        || detail.as_bytes().windows(3).any(|part| {
+            part[0].is_ascii_alphabetic() && part[1] == b':' && matches!(part[2], b'\\' | b'/')
+        })
         || detail.is_empty()
     {
         detail = fallback.into();
@@ -497,37 +511,49 @@ fn anonymized_error(error: &str) -> (String, String) {
 #[tauri::command]
 fn apply_sort(folder: String, items: Vec<PlanItem>) -> Result<usize, String> {
     let root = canonical_root(&folder)?;
-    let mut records = Vec::new();
-    let mut seen = HashSet::new();
+    ensure_root_writable(&root)?;
+    let mut planned = Vec::new();
+    let mut reserved_destinations = HashSet::new();
+    let mut seen_sources = HashSet::new();
     for item in items {
+        if !item.included {
+            continue;
+        }
         let source = canonical_inside(&root, Path::new(&item.source))?;
         let destination = safe_destination(&root, &item.target)?;
         if source == destination {
             continue;
         }
-        if !seen.insert(destination.clone()) {
-            return Err(format!(
-                "Повторяющийся целевой путь: {}",
-                destination.display()
-            ));
+        if !seen_sources.insert(normalized_path_key(&source)) {
+            return Err("Один исходный файл добавлен в план несколько раз".into());
         }
-        let destination = conflict_free(&destination);
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent).map_err(io_error)?;
-        }
-        fs::rename(&source, &destination).map_err(io_error)?;
-        records.push(MoveRecord {
-            from: source.to_string_lossy().into_owned(),
-            to: destination.to_string_lossy().into_owned(),
+        let destination = conflict_free_reserved(&destination, &mut reserved_destinations);
+        planned.push(PlannedMove {
+            from: source,
+            to: destination,
         });
     }
-    let history = root.join(HISTORY_FILE);
-    fs::write(
-        history,
-        serde_json::to_vec_pretty(&records).map_err(|e| e.to_string())?,
-    )
-    .map_err(io_error)?;
-    Ok(records.len())
+    if planned.is_empty() {
+        return Ok(0);
+    }
+
+    let records: Vec<MoveRecord> = planned
+        .iter()
+        .map(|operation| MoveRecord {
+            from: operation.from.to_string_lossy().into_owned(),
+            to: operation.to.to_string_lossy().into_owned(),
+        })
+        .collect();
+    let history_data = serde_json::to_vec_pretty(&records).map_err(|e| e.to_string())?;
+    let completed = execute_moves(&planned)?;
+    if let Err(error) = write_history(&root, &history_data) {
+        return Err(operation_error_with_rollback(
+            "Не удалось сохранить журнал отмены",
+            &error,
+            &completed,
+        ));
+    }
+    Ok(completed.len())
 }
 
 #[tauri::command]
@@ -537,19 +563,31 @@ fn undo_last_sort(folder: String) -> Result<usize, String> {
     let raw = fs::read(&history).map_err(|_| "Нет операции для отмены".to_string())?;
     let records: Vec<MoveRecord> =
         serde_json::from_slice(&raw).map_err(|_| "Журнал операции повреждён".to_string())?;
-    let mut restored = 0;
+    ensure_root_writable(&root)?;
+    let mut planned = Vec::new();
+    let mut reserved_destinations = HashSet::new();
+    let mut seen_sources = HashSet::new();
     for record in records.into_iter().rev() {
         let current = canonical_inside(&root, Path::new(&record.to))?;
         let original = safe_recorded_destination(&root, Path::new(&record.from))?;
-        let original = conflict_free(&original);
-        if let Some(parent) = original.parent() {
-            fs::create_dir_all(parent).map_err(io_error)?;
+        if !seen_sources.insert(normalized_path_key(&current)) {
+            return Err("Журнал отмены содержит повторяющийся файл".into());
         }
-        fs::rename(current, original).map_err(io_error)?;
-        restored += 1;
+        let original = conflict_free_reserved(&original, &mut reserved_destinations);
+        planned.push(PlannedMove {
+            from: current,
+            to: original,
+        });
     }
-    fs::remove_file(history).map_err(io_error)?;
-    Ok(restored)
+    let completed = execute_moves(&planned)?;
+    if let Err(error) = fs::remove_file(history) {
+        return Err(operation_error_with_rollback(
+            "Не удалось удалить использованный журнал отмены",
+            &error.to_string(),
+            &completed,
+        ));
+    }
+    Ok(completed.len())
 }
 
 #[tauri::command]
@@ -684,14 +722,41 @@ fn scan_entry(entry: &walkdir::DirEntry) -> bool {
         return true;
     }
     let name = entry.file_name().to_string_lossy();
+    let normalized = name.to_ascii_lowercase();
     !(entry.file_type().is_dir()
-        && (name == SORTED_DIR || name.to_ascii_lowercase().ends_with(".app")))
+        && (name.eq_ignore_ascii_case(SORTED_DIR)
+            || normalized.ends_with(".app")
+            || normalized == "$recycle.bin"
+            || normalized == "system volume information"))
 }
 fn skip_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if name.starts_with(".ai-file-sorter-") {
+        return true;
+    }
     matches!(
-        path.file_name().and_then(|name| name.to_str()),
-        Some(".DS_Store") | Some(".localized")
+        name.to_ascii_lowercase().as_str(),
+        ".ds_store" | ".localized" | "thumbs.db" | "desktop.ini"
     )
+}
+
+fn is_loopback_endpoint(value: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(value.trim()) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 fn canonical_root(folder: &str) -> Result<PathBuf, String> {
     let path = fs::canonicalize(folder).map_err(io_error)?;
@@ -713,19 +778,20 @@ fn safe_destination(root: &Path, relative: &str) -> Result<PathBuf, String> {
         || p.components().any(|c| {
             matches!(
                 c,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                Component::ParentDir
+                    | Component::RootDir
+                    | Component::Prefix(_)
+                    | Component::CurDir
             )
         })
     {
         return Err("Недопустимый целевой путь".into());
     }
-    if p.components().any(|c| {
-        c.as_os_str()
-            .to_string_lossy()
-            .chars()
-            .any(|ch| matches!(ch, ':' | '*' | '?' | '"' | '<' | '>' | '|'))
-    }) {
-        return Err("Недопустимые символы в имени папки или файла".into());
+    for component in p.components() {
+        let name = component.as_os_str().to_string_lossy();
+        if !windows_compatible_component(&name) {
+            return Err("Имя папки или файла несовместимо с Windows".into());
+        }
     }
     let out = root.join(p);
     if !out.starts_with(root) {
@@ -739,47 +805,199 @@ fn safe_recorded_destination(root: &Path, candidate: &Path) -> Result<PathBuf, S
     }
     if candidate
         .components()
-        .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+        .any(|component| matches!(component, Component::ParentDir))
         || !candidate.starts_with(root)
     {
         return Err("Путь выходит за пределы выбранной папки".into());
     }
     Ok(candidate.to_path_buf())
 }
-fn conflict_free(path: &Path) -> PathBuf {
-    if !path.exists() {
-        return path.to_path_buf();
-    }
+
+fn normalized_path_key(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/").to_lowercase()
+}
+
+fn conflict_free_reserved(path: &Path, reserved: &mut HashSet<String>) -> PathBuf {
     let stem = path.file_stem().and_then(|x| x.to_str()).unwrap_or("file");
     let ext = path
         .extension()
         .and_then(|x| x.to_str())
         .map(|x| format!(".{x}"))
         .unwrap_or_default();
-    for i in 2.. {
-        let candidate = path.with_file_name(format!("{stem} ({i}){ext}"));
-        if !candidate.exists() {
+    for index in 1.. {
+        let candidate = if index == 1 {
+            path.to_path_buf()
+        } else {
+            path.with_file_name(format!("{stem} ({index}){ext}"))
+        };
+        let key = normalized_path_key(&candidate);
+        if !candidate.exists() && reserved.insert(key) {
             return candidate;
         }
     }
     unreachable!()
 }
+
+fn ensure_root_writable(root: &Path) -> Result<(), String> {
+    let probe = root.join(format!(".ai-file-sorter-write-test-{}", Uuid::new_v4()));
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .map_err(|error| {
+            format!(
+                "Выбранная папка или диск недоступны для записи: {error}. Файлы не перемещались"
+            )
+        })?;
+    drop(file);
+    if let Err(error) = fs::remove_file(&probe) {
+        return Err(format!(
+            "Проверочный файл создан, но не удалён: {error}. Сортировка не запускалась"
+        ));
+    }
+    Ok(())
+}
+
+fn execute_moves(planned: &[PlannedMove]) -> Result<Vec<PlannedMove>, String> {
+    let mut completed = Vec::new();
+    for operation in planned {
+        if let Some(parent) = operation.to.parent() {
+            if let Err(error) = fs::create_dir_all(parent) {
+                return Err(operation_error_with_rollback(
+                    "Не удалось создать целевую папку",
+                    &error.to_string(),
+                    &completed,
+                ));
+            }
+        }
+        if operation.to.exists() {
+            return Err(operation_error_with_rollback(
+                "Целевой файл появился после проверки конфликтов",
+                "операция остановлена, чтобы не перезаписать существующий файл",
+                &completed,
+            ));
+        }
+        if let Err(error) = fs::rename(&operation.from, &operation.to) {
+            return Err(operation_error_with_rollback(
+                "Не удалось переместить файл",
+                &error.to_string(),
+                &completed,
+            ));
+        }
+        completed.push(operation.clone());
+    }
+    Ok(completed)
+}
+
+fn rollback_moves(completed: &[PlannedMove]) -> Result<(), String> {
+    let mut failures = 0usize;
+    for operation in completed.iter().rev() {
+        if operation.from.exists() || !operation.to.exists() {
+            failures += 1;
+            continue;
+        }
+        if let Some(parent) = operation.from.parent() {
+            if fs::create_dir_all(parent).is_err() {
+                failures += 1;
+                continue;
+            }
+        }
+        if fs::rename(&operation.to, &operation.from).is_err() {
+            failures += 1;
+        }
+    }
+    if failures == 0 {
+        Ok(())
+    } else {
+        Err(format!("не удалось вернуть файлов: {failures}"))
+    }
+}
+
+fn operation_error_with_rollback(context: &str, error: &str, completed: &[PlannedMove]) -> String {
+    if completed.is_empty() {
+        return format!("{context}: {error}. Файлы не перемещались");
+    }
+    match rollback_moves(completed) {
+        Ok(()) => format!("{context}: {error}. Уже перемещённые файлы возвращены обратно"),
+        Err(rollback_error) => format!(
+            "{context}: {error}. ВНИМАНИЕ: автоматический откат выполнен не полностью ({rollback_error})"
+        ),
+    }
+}
+
+fn write_history(root: &Path, data: &[u8]) -> Result<(), String> {
+    let history = root.join(HISTORY_FILE);
+    let temporary = root.join(format!("{HISTORY_FILE}.{}.tmp", Uuid::new_v4()));
+    let backup = root.join(format!("{HISTORY_FILE}.{}.bak", Uuid::new_v4()));
+    fs::write(&temporary, data).map_err(io_error)?;
+
+    let had_history = history.exists();
+    if had_history {
+        if let Err(error) = fs::rename(&history, &backup) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error.to_string());
+        }
+    }
+    if let Err(error) = fs::rename(&temporary, &history) {
+        if had_history {
+            let _ = fs::rename(&backup, &history);
+        }
+        let _ = fs::remove_file(&temporary);
+        return Err(error.to_string());
+    }
+    if had_history {
+        let _ = fs::remove_file(backup);
+    }
+    Ok(())
+}
+
 fn io_error(e: std::io::Error) -> String {
     e.to_string()
 }
+
+fn is_windows_reserved_name(value: &str) -> bool {
+    let stem = value
+        .split('.')
+        .next()
+        .unwrap_or(value)
+        .to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || stem
+            .strip_prefix("COM")
+            .or_else(|| stem.strip_prefix("LPT"))
+            .is_some_and(|number| {
+                matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+            })
+}
+
+fn windows_compatible_component(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && !value.ends_with([' ', '.'])
+        && !is_windows_reserved_name(value)
+        && !value.chars().any(|ch| {
+            ch.is_control() || matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+        })
+}
+
 fn safe_name(value: &str) -> String {
     let clean: String = value
         .chars()
         .map(|c| {
-            if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+            if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
                 '_'
             } else {
                 c
             }
         })
+        .take(80)
         .collect();
-    if clean.trim().is_empty() {
+    let clean = clean.trim().trim_end_matches('.').trim_end().to_string();
+    if clean.is_empty() || clean == "." || clean == ".." {
         "Прочее".into()
+    } else if is_windows_reserved_name(&clean) {
+        format!("_{clean}")
     } else {
         clean
     }
@@ -844,8 +1062,19 @@ fn read_text_preview(path: &Path, ext: &str, limit: usize) -> (Option<String>, S
             "Достигнут общий лимит текста; использованы метаданные файла.".into(),
         );
     }
-    match fs::read_to_string(path) {
-        Ok(text) => {
+    let max_bytes = if limit == usize::MAX {
+        u64::MAX
+    } else {
+        u64::try_from(limit.saturating_mul(4).saturating_add(4)).unwrap_or(u64::MAX)
+    };
+    let mut bytes = Vec::new();
+    let read_result = fs::File::open(path).and_then(|file| {
+        let mut reader = file.take(max_bytes);
+        reader.read_to_end(&mut bytes)
+    });
+    match read_result {
+        Ok(_) => {
+            let text = String::from_utf8_lossy(&bytes);
             let excerpt: String = text.chars().take(limit).collect();
             if excerpt.is_empty() {
                 (
@@ -1938,14 +2167,27 @@ mod tests {
         let root = std::env::temp_dir().join(format!("ai-file-sorter-scan-{}", Uuid::new_v4()));
         fs::create_dir_all(root.join("AI Sorted/old")).unwrap();
         fs::create_dir_all(root.join("Example.app/Contents")).unwrap();
+        fs::create_dir_all(root.join("$RECYCLE.BIN/trash")).unwrap();
+        fs::create_dir_all(root.join("System Volume Information/index")).unwrap();
         fs::write(root.join("keep.txt"), "keep").unwrap();
+        fs::write(root.join("Thumbs.db"), "skip").unwrap();
+        fs::write(root.join("desktop.ini"), "skip").unwrap();
+        fs::write(root.join(HISTORY_FILE), "skip").unwrap();
+        fs::write(root.join(".ai-file-sorter-last-operation.test.bak"), "skip").unwrap();
         fs::write(root.join("AI Sorted/old/skip.txt"), "skip").unwrap();
         fs::write(root.join("Example.app/Contents/skip.txt"), "skip").unwrap();
+        fs::write(root.join("$RECYCLE.BIN/trash/skip.txt"), "skip").unwrap();
+        fs::write(
+            root.join("System Volume Information/index/skip.txt"),
+            "skip",
+        )
+        .unwrap();
         let files: Vec<PathBuf> = WalkDir::new(&root)
             .into_iter()
             .filter_entry(scan_entry)
             .filter_map(Result::ok)
             .filter(|entry| entry.file_type().is_file())
+            .filter(|entry| !skip_file(entry.path()))
             .map(|entry| entry.into_path())
             .collect();
         assert_eq!(files, vec![root.join("keep.txt")]);
@@ -1955,6 +2197,134 @@ mod tests {
     #[test]
     fn names_are_sanitized() {
         assert_eq!(safe_name("A/B: C"), "A_B_ C");
+        assert_eq!(safe_name("CON"), "_CON");
+        assert_eq!(safe_name("nul.txt"), "_nul.txt");
+        assert_eq!(safe_name("Категория.   "), "Категория");
+        assert_eq!(safe_name(".."), "Прочее");
+        assert!(safe_name(&"a".repeat(200)).chars().count() <= 80);
+    }
+
+    #[test]
+    fn windows_incompatible_target_components_are_rejected() {
+        let root = Path::new("/tmp/root");
+        assert!(safe_destination(root, "AI Sorted/CON/file.txt").is_err());
+        assert!(safe_destination(root, "AI Sorted/Работа./file.txt").is_err());
+        assert!(safe_destination(root, "AI Sorted/Работа/file?.txt").is_err());
+    }
+
+    #[test]
+    fn only_real_loopback_hosts_bypass_cloud_consent() {
+        assert!(is_loopback_endpoint("http://localhost:1234/v1"));
+        assert!(is_loopback_endpoint("http://127.0.0.1:11434"));
+        assert!(is_loopback_endpoint("http://127.12.34.56:11434"));
+        assert!(is_loopback_endpoint("http://[::1]:1234/v1"));
+        assert!(!is_loopback_endpoint("https://example.com/?next=localhost"));
+        assert!(!is_loopback_endpoint("https://localhost.example.com/v1"));
+        assert!(!is_loopback_endpoint("not a URL containing localhost"));
+    }
+
+    #[test]
+    fn planned_destinations_are_reserved_case_insensitively() {
+        let mut reserved = HashSet::new();
+        let root = std::env::temp_dir().join(format!("ai-file-sorter-case-{}", Uuid::new_v4()));
+        let first = conflict_free_reserved(&root.join("Report.txt"), &mut reserved);
+        let second = conflict_free_reserved(&root.join("report.txt"), &mut reserved);
+        assert_eq!(first.file_name().unwrap(), "Report.txt");
+        assert_eq!(second.file_name().unwrap(), "report (2).txt");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_absolute_history_paths_stay_inside_root() {
+        let root = Path::new(r"C:\Selected");
+        assert_eq!(
+            safe_recorded_destination(root, Path::new(r"C:\Selected\incoming\file.txt")).unwrap(),
+            PathBuf::from(r"C:\Selected\incoming\file.txt")
+        );
+        assert!(safe_recorded_destination(root, Path::new(r"D:\outside\file.txt")).is_err());
+    }
+
+    #[test]
+    fn apply_rolls_back_files_when_a_later_move_fails() {
+        let root = std::env::temp_dir().join(format!("ai-file-sorter-rollback-{}", Uuid::new_v4()));
+        let first = root.join("incoming/first.txt");
+        let second = root.join("incoming/second.txt");
+        fs::create_dir_all(first.parent().unwrap()).unwrap();
+        fs::write(&first, "first").unwrap();
+        fs::write(&second, "second").unwrap();
+        fs::write(root.join("blocked"), "not a directory").unwrap();
+        let items = vec![
+            PlanItem {
+                id: "first".into(),
+                source: first.to_string_lossy().into_owned(),
+                relative_path: "incoming/first.txt".into(),
+                target: "AI Sorted/Работа/first.txt".into(),
+                category: "Работа".into(),
+                explanation: "test".into(),
+                confidence: 1.0,
+                included: true,
+                warning: None,
+                ai_status: AiStatus::Processed,
+                ai_error: None,
+            },
+            PlanItem {
+                id: "second".into(),
+                source: second.to_string_lossy().into_owned(),
+                relative_path: "incoming/second.txt".into(),
+                target: "blocked/sub/second.txt".into(),
+                category: "Работа".into(),
+                explanation: "test".into(),
+                confidence: 1.0,
+                included: true,
+                warning: None,
+                ai_status: AiStatus::Processed,
+                ai_error: None,
+            },
+        ];
+        let error = apply_sort(root.to_string_lossy().into_owned(), items).unwrap_err();
+        assert!(error.contains("возвращены обратно"), "{error}");
+        assert_eq!(fs::read_to_string(&first).unwrap(), "first");
+        assert_eq!(fs::read_to_string(&second).unwrap(), "second");
+        assert!(!root.join(HISTORY_FILE).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn undo_rolls_back_restores_when_a_later_restore_fails() {
+        let root =
+            std::env::temp_dir().join(format!("ai-file-sorter-undo-rollback-{}", Uuid::new_v4()));
+        let current_first = root.join("AI Sorted/first.txt");
+        let current_second = root.join("AI Sorted/second.txt");
+        fs::create_dir_all(current_first.parent().unwrap()).unwrap();
+        fs::write(&current_first, "first").unwrap();
+        fs::write(&current_second, "second").unwrap();
+        fs::write(root.join("blocked"), "not a directory").unwrap();
+        let canonical = fs::canonicalize(&root).unwrap();
+        let original_first = canonical.join("incoming/first.txt");
+        let original_second = canonical.join("blocked/sub/second.txt");
+        let records = vec![
+            MoveRecord {
+                from: original_second.to_string_lossy().into_owned(),
+                to: current_second.to_string_lossy().into_owned(),
+            },
+            MoveRecord {
+                from: original_first.to_string_lossy().into_owned(),
+                to: current_first.to_string_lossy().into_owned(),
+            },
+        ];
+        fs::write(
+            root.join(HISTORY_FILE),
+            serde_json::to_vec(&records).unwrap(),
+        )
+        .unwrap();
+
+        let error = undo_last_sort(root.to_string_lossy().into_owned()).unwrap_err();
+        assert!(error.contains("возвращены обратно"), "{error}");
+        assert_eq!(fs::read_to_string(&current_first).unwrap(), "first");
+        assert_eq!(fs::read_to_string(&current_second).unwrap(), "second");
+        assert!(!original_first.exists());
+        assert!(root.join(HISTORY_FILE).exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1963,6 +2333,16 @@ mod tests {
             classify(Path::new("tax_invoice.pdf"), "pdf", &test_sort()).0,
             "Финансы"
         );
+    }
+
+    #[test]
+    fn text_preview_respects_character_limit_without_reading_the_whole_file() {
+        let path = std::env::temp_dir().join(format!("ai-file-sorter-text-{}.txt", Uuid::new_v4()));
+        fs::write(&path, "😀😀😀😀😀секретный хвост").unwrap();
+        let (preview, status) = read_text_preview(&path, "txt", 5);
+        assert_eq!(preview.as_deref(), Some("😀😀😀😀😀"));
+        assert!(status.contains("фрагмент"));
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

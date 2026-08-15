@@ -21,9 +21,17 @@ const formatAnalysisLog = (event: AnalysisLogEvent) => {
   return `${phase} ${event.batchNumber}/${event.totalBatches} · попытка ${event.attempt}/2 · ${event.fileCount} файлов · расширения: ${formatExtensions(event)} · ${formatDuration(event.durationMs)} · ${outcome} · успешно: ${event.successfulFiles} · ${unresolvedLabel}: ${event.unresolvedFiles}${event.errorDetail ? ` · ${event.errorDetail}` : ""}`;
 };
 const isBatchWarning = (warning: string) => warning.startsWith("Основной проход, пакет ") || warning.startsWith("Повторный проход, пакет ");
+const isLoopbackEndpoint = (value: string) => {
+  try {
+    const host = new URL(value).hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "").toLowerCase();
+    return host === "localhost" || host === "::1" || /^127(?:\.\d{1,3}){3}$/.test(host);
+  } catch {
+    return false;
+  }
+};
 const anonymizedUiError = (value: unknown) => {
   const text = String(value);
-  if (/https?:\/\/|file:\/\/|\/Users\/|\/Volumes\/|\\Users\\/i.test(text)) return "Техническая ошибка; адрес или локальный путь скрыт.";
+  if (/https?:\/\/|file:\/\/|\/Users\/|\/Volumes\/|\\Users\\|[A-Z]:[\\/]|\\\\/i.test(text)) return "Техническая ошибка; адрес или локальный путь скрыт.";
   return text.length > 240 ? `${text.slice(0, 237)}…` : text;
 };
 
@@ -40,7 +48,7 @@ function App() {
   useEffect(() => { const subscription = listen<AnalysisLogEvent>("analysis-log", event => setLog(current => [...current, timestamped(formatAnalysisLog(event.payload))])); return () => { void subscription.then(unlisten => unlisten()); }; }, []);
   const included = useMemo(() => result?.items.filter((item) => item.included).length ?? 0, [result]);
   const locked = busy || analyzing;
-  const local = ai.provider === "lmstudio" || ai.provider === "ollama" || /^(https?:\/\/)?(127\.0\.0\.1|localhost)/.test(ai.baseUrl);
+  const local = isLoopbackEndpoint(ai.baseUrl);
   const writeLog = (message: string) => setLog((current) => [...current, timestamped(message)]);
   const loadModels = async (settings = ai) => { try { const found = await invoke<ModelList>("list_models", { ai: settings }); setModels(found.models); setAi(current => current.provider === settings.provider && current.baseUrl === settings.baseUrl && !userSelectedModel.current ? { ...current, model: found.activeModel || found.models[0] } : current); writeLog(found.activeModel ? "Активная модель LM Studio выбрана." : `Найдены модели: ${found.models.length}.`); } catch (error) { setModels([]); writeLog(`Не удалось получить список моделей: ${anonymizedUiError(error)}`); } };
   useEffect(() => { if (ai.provider === "lmstudio" || ai.provider === "ollama") void loadModels(); }, [ai.provider]);
