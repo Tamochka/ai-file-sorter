@@ -26,6 +26,7 @@ input, select, textarea { font: inherit; border: 1px solid #bcc4cf; border-radiu
 input[type=checkbox], input[type=radio] { width: auto; padding: 0; }
 button { font: inherit; border: 1px solid #9aa4b2; border-radius: 4px; background: #fff; padding: 7px 11px; cursor: pointer; }
 button.primary { background: #1769aa; color: #fff; border-color: #1769aa; }
+button.danger { background: #b3261e; color: #fff; border-color: #b3261e; }
 button:disabled { opacity: .5; cursor: default; }
 output { font-size: 13px; overflow-wrap: anywhere; }
 .hint, small { font-size: 12px; color: #65717e; }
@@ -33,6 +34,10 @@ textarea { min-height: 70px; margin-top: 10px; }
 .analysis-summary { margin: 0 0 10px; padding: 8px 10px; border-radius: 5px; font-size: 13px; }
 .analysis-summary.all-processed { background: #e5f7e9; color: #215d31; }
 .analysis-summary.has-errors { background: #ffe5e5; color: #8b1f1f; border: 1px solid #efb0b0; }
+.analysis-progress { margin-top: 12px; padding: 10px; border: 1px solid #b9d2e8; border-radius: 5px; background: #eef7ff; }
+.analysis-progress div { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; }
+.analysis-progress span { color: #536474; text-align: right; }
+.analysis-progress progress { width: 100%; height: 10px; margin-top: 8px; accent-color: #1769aa; }
 .table-wrap { max-height: 360px; overflow: auto; border: 1px solid #e2e5e9; }
 table { border-collapse: collapse; min-width: 1120px; width: 100%; font-size: 12px; }
 th, td { text-align: left; vertical-align: top; border-bottom: 1px solid #e4e7eb; padding: 7px; }
@@ -53,6 +58,7 @@ html[data-theme="dark"] .dark section { background: #171e27; border-color: #3542
 html[data-theme="dark"] .dark input, html[data-theme="dark"] .dark select, html[data-theme="dark"] .dark textarea { background: #0e141c; color: #e7edf5; border-color: #526174; }
 html[data-theme="dark"] .dark button { background: #253141; border-color: #627287; color: #eef5ff; }
 html[data-theme="dark"] .dark button.primary { background: #1976c2; border-color: #3996df; }
+html[data-theme="dark"] .dark button.danger { background: #a93a34; border-color: #dc6159; }
 html[data-theme="dark"] .dark .status { background: #334151; color: #eef5ff; }
 html[data-theme="dark"] .dark .status-Требуется-подтверждение { background: #70570f; color: #fff1bc; }
 html[data-theme="dark"] .dark .status-Ошибка { background: #713333; color: #ffe4e4; }
@@ -60,6 +66,8 @@ html[data-theme="dark"] .dark .status-Завершено { background: #28533a; 
 html[data-theme="dark"] .dark .hint, html[data-theme="dark"] .dark small { color: #aebaca; }
 html[data-theme="dark"] .dark .analysis-summary.all-processed { background: #1f4b2d; color: #dff7e5; }
 html[data-theme="dark"] .dark .analysis-summary.has-errors { background: #5c2525; color: #ffe3e3; border-color: #934747; }
+html[data-theme="dark"] .dark .analysis-progress { background: #172b3b; border-color: #315673; }
+html[data-theme="dark"] .dark .analysis-progress span { color: #b9c9d8; }
 html[data-theme="dark"] .dark .table-wrap { border-color: #354252; }
 html[data-theme="dark"] .dark th { background: #263242; }
 html[data-theme="dark"] .dark th, html[data-theme="dark"] .dark td { border-color: #354252; }

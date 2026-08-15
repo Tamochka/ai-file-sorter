@@ -1,6 +1,6 @@
 {
   "productName": "AI File Sorter",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "identifier": "com.local.aifilesorter",
   "build": {
     "beforeDevCommand": "npm run dev",
