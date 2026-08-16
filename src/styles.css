@@ -51,6 +51,7 @@ td input { min-width: 110px; padding: 4px; font-size: 12px; }
 .ai-unprocessed-row td input { border-color: #db7777; background: #fff8f8; }
 .row-warning { display: block; margin-top: 5px; color: #8a5b00; }
 pre { background: #151a20; color: #dce4ed; padding: 10px; white-space: pre-wrap; max-height: 180px; overflow: auto; font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; margin: 0; }
+.diagnostic-log { max-height: 320px; line-height: 1.5; }
 
 html[data-theme="dark"], html[data-theme="dark"] body, html[data-theme="dark"] #root { background: #0d1117; color: #e7edf5; }
 html[data-theme="dark"] .dark { color: #e7edf5; }

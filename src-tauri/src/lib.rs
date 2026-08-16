@@ -1,15 +1,18 @@
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet},
-    fs,
+    collections::{BTreeMap, HashMap, HashSet},
+    fs::{self, OpenOptions},
     future::Future,
+    io::Read,
+    net::IpAddr,
+    ops::Range,
     path::{Component, Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tauri::Emitter;
 use uuid::Uuid;
@@ -77,6 +80,12 @@ struct MoveRecord {
     from: String,
     to: String,
 }
+
+#[derive(Debug, Clone)]
+struct PlannedMove {
+    from: PathBuf,
+    to: PathBuf,
+}
 #[derive(Debug, Deserialize)]
 struct AiDecision {
     id: String,
@@ -112,7 +121,35 @@ struct AnalysisProgress {
     total_batches: usize,
     processed_files: usize,
     pending_files: usize,
+    not_attempted_files: usize,
+    retry_pending_files: usize,
     message: String,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ExtensionCount {
+    extension: String,
+    count: usize,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct AnalysisLogEvent {
+    phase: String,
+    attempt: Option<usize>,
+    batch_number: Option<usize>,
+    total_batches: Option<usize>,
+    file_count: usize,
+    extensions: Vec<ExtensionCount>,
+    duration_ms: u64,
+    outcome: String,
+    successful_files: usize,
+    unresolved_files: usize,
+    skipped_files: usize,
+    input_bytes: Option<usize>,
+    error_kind: Option<String>,
+    error_detail: Option<String>,
 }
 
 #[derive(Default)]
@@ -134,12 +171,18 @@ struct PreparedAnalysis {
     contexts: Vec<AiFileContext>,
     total_chars: usize,
     warnings: Vec<String>,
+    inaccessible_files: usize,
 }
 
 const SORTED_DIR: &str = "AI Sorted";
 const UNPROCESSED_CATEGORY: &str = "Не обработано ИИ";
 const HISTORY_FILE: &str = ".ai-file-sorter-last-operation.json";
 const AI_BATCH_SIZE: usize = 10;
+// These limits are intentionally independent of the user-facing total limit.
+// A local model with a small context must never receive an unbounded prompt.
+const MAX_TEXT_CHARS_PER_FILE: usize = 3_000;
+const MAX_BATCH_CONTEXT_BYTES: usize = 8_000;
+const MAX_MODEL_RESPONSE_TOKENS: usize = 1_024;
 const AI_BATCH_TIMEOUT: Duration = Duration::from_secs(90);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -154,10 +197,7 @@ async fn analyze_folder(
     if ai.model.trim().is_empty() {
         return Err("Укажите имя модели".into());
     }
-    let is_local = ai.provider == "lmstudio"
-        || ai.provider == "ollama"
-        || ai.base_url.contains("localhost")
-        || ai.base_url.contains("127.0.0.1");
+    let is_local = is_loopback_endpoint(&ai.base_url);
     if !is_local && !ai.cloud_consent {
         return Err("Нужно подтвердить передачу данных в облако".into());
     }
@@ -180,10 +220,13 @@ async fn analyze_folder(
             total_batches: 0,
             processed_files: 0,
             pending_files: 0,
+            not_attempted_files: 0,
+            retry_pending_files: 0,
             message: "Сканирование файлов…".into(),
         },
     );
 
+    let scan_started = Instant::now();
     let scan_cancelled = cancelled.clone();
     let scan_sort = sort.clone();
     let prepared = tauri::async_runtime::spawn_blocking(move || {
@@ -207,8 +250,29 @@ async fn analyze_folder(
         contexts,
         total_chars,
         mut warnings,
+        inaccessible_files,
     } = prepared;
+    emit_analysis_log(
+        &app,
+        AnalysisLogEvent {
+            phase: "scanning".into(),
+            attempt: None,
+            batch_number: None,
+            total_batches: None,
+            file_count: contexts.len(),
+            extensions: extension_summary(&contexts),
+            duration_ms: elapsed_ms(scan_started),
+            outcome: "success".into(),
+            successful_files: contexts.len(),
+            unresolved_files: 0,
+            skipped_files: inaccessible_files,
+            input_bytes: None,
+            error_kind: None,
+            error_detail: None,
+        },
+    );
     let progress_app = app.clone();
+    let log_app = app.clone();
     let refinement = refine_with_model(
         &client,
         &ai,
@@ -216,7 +280,10 @@ async fn analyze_folder(
         &mut items,
         &contexts,
         cancelled,
-        move |progress| emit_progress(&progress_app, progress),
+        (
+            move |progress| emit_progress(&progress_app, progress),
+            move |event| emit_analysis_log(&log_app, event),
+        ),
     )
     .await?;
     warnings.extend(refinement.warnings);
@@ -245,14 +312,29 @@ fn prepare_analysis(
     let mut items = Vec::new();
     let mut contexts = Vec::new();
     let mut warnings = Vec::new();
-    for entry in WalkDir::new(&root)
-        .into_iter()
-        .filter_entry(scan_entry)
-        .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_file())
-    {
+    let mut inaccessible_files = 0usize;
+    if sort.unlimited {
+        warnings.push(format!(
+            "Без общего лимита: все файлы будут проанализированы, но в ИИ передаётся не более {MAX_TEXT_CHARS_PER_FILE} символов текста на файл и {MAX_BATCH_CONTEXT_BYTES} байт контекста на запрос."
+        ));
+    } else if sort.text_limit > MAX_TEXT_CHARS_PER_FILE {
+        warnings.push(format!(
+            "Лимит текста на файл ограничен техническим максимумом {MAX_TEXT_CHARS_PER_FILE} символов, чтобы не превысить контекст модели."
+        ));
+    }
+    for entry in WalkDir::new(&root).into_iter().filter_entry(scan_entry) {
         if cancelled.load(Ordering::Acquire) {
             return Err("Анализ отменён пользователем".into());
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                inaccessible_files += 1;
+                continue;
+            }
+        };
+        if !entry.file_type().is_file() {
+            continue;
         }
         let path = entry.path();
         let relative = path
@@ -264,7 +346,7 @@ fn prepare_analysis(
         let metadata = match fs::metadata(path) {
             Ok(data) => data,
             Err(_) => {
-                warnings.push(format!("Нет доступа к {}", relative.display()));
+                inaccessible_files += 1;
                 continue;
             }
         };
@@ -279,17 +361,12 @@ fn prepare_analysis(
             sort.total_limit.saturating_sub(total_chars)
         };
         let per_file_limit = if sort.unlimited {
-            usize::MAX
+            MAX_TEXT_CHARS_PER_FILE
         } else {
-            sort.text_limit
+            sort.text_limit.min(MAX_TEXT_CHARS_PER_FILE)
         };
         let (content_extract, content_status) =
             read_text_preview(path, &ext, per_file_limit.min(remaining));
-        total_chars = total_chars.saturating_add(
-            content_extract
-                .as_ref()
-                .map_or(0, |text| text.chars().count()),
-        );
         let (category, confidence, explanation) = classify(relative, &ext, sort);
         let date = metadata
             .modified()
@@ -303,7 +380,7 @@ fn prepare_analysis(
             .join(date)
             .join(relative);
         let id = Uuid::new_v4().to_string();
-        contexts.push(AiFileContext {
+        let mut context = AiFileContext {
             id: id.clone(),
             path: relative.to_string_lossy().into_owned(),
             extension: ext.clone(),
@@ -313,7 +390,15 @@ fn prepare_analysis(
             suggested_category: category.clone(),
             content_extract,
             content_status,
-        });
+        };
+        fit_context_into_model_budget(&mut context);
+        total_chars = total_chars.saturating_add(
+            context
+                .content_extract
+                .as_ref()
+                .map_or(0, |text| text.chars().count()),
+        );
+        contexts.push(context);
         items.push(PlanItem {
             id,
             source: path.to_string_lossy().into_owned(),
@@ -331,11 +416,17 @@ fn prepare_analysis(
     if sort.mode == "custom" && sort.custom_prompt.trim().is_empty() {
         warnings.push("Кастомный режим без инструкции использовал стандартные категории.".into());
     }
+    if inaccessible_files > 0 {
+        warnings.push(format!(
+            "Нет доступа к {inaccessible_files} объектам; их имена и пути скрыты."
+        ));
+    }
     Ok(PreparedAnalysis {
         items,
         contexts,
         total_chars,
         warnings,
+        inaccessible_files,
     })
 }
 
@@ -352,40 +443,198 @@ fn emit_progress(app: &tauri::AppHandle, progress: AnalysisProgress) {
     let _ = app.emit("analysis-progress", progress);
 }
 
+fn emit_analysis_log(app: &tauri::AppHandle, event: AnalysisLogEvent) {
+    let _ = app.emit("analysis-log", event);
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn extension_summary(contexts: &[AiFileContext]) -> Vec<ExtensionCount> {
+    const MAX_EXTENSIONS: usize = 12;
+    let mut counts = BTreeMap::<String, usize>::new();
+    for context in contexts {
+        let extension = if context.extension.trim().is_empty() {
+            "без расширения".to_string()
+        } else {
+            format!(".{}", context.extension.trim().to_lowercase())
+        };
+        *counts.entry(extension).or_default() += 1;
+    }
+    let mut summary: Vec<ExtensionCount> = counts
+        .into_iter()
+        .map(|(extension, count)| ExtensionCount { extension, count })
+        .collect();
+    summary.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.extension.cmp(&right.extension))
+    });
+    if summary.len() > MAX_EXTENSIONS {
+        let other_count = summary[MAX_EXTENSIONS..]
+            .iter()
+            .map(|entry| entry.count)
+            .sum();
+        summary.truncate(MAX_EXTENSIONS);
+        summary.push(ExtensionCount {
+            extension: "другие".into(),
+            count: other_count,
+        });
+    }
+    summary
+}
+
+fn model_context_bytes(context: &AiFileContext) -> usize {
+    serde_json::to_vec(context)
+        .map(|serialized| serialized.len())
+        .unwrap_or(usize::MAX)
+}
+
+fn model_batch_context_bytes(batch: &[AiFileContext]) -> usize {
+    batch.iter().fold(0usize, |total, context| {
+        total.saturating_add(model_context_bytes(context))
+    })
+}
+
+fn shorten_text(value: &str, maximum_chars: usize) -> String {
+    value.chars().take(maximum_chars).collect()
+}
+
+fn fit_context_into_model_budget(context: &mut AiFileContext) {
+    let mut was_shortened = false;
+    while model_context_bytes(context) > MAX_BATCH_CONTEXT_BYTES {
+        let Some(text) = context.content_extract.as_ref() else {
+            break;
+        };
+        let length = text.chars().count();
+        if length == 0 {
+            break;
+        }
+        let reduced_length = length.saturating_mul(3).saturating_div(4).max(1);
+        context.content_extract = Some(shorten_text(text, reduced_length));
+        was_shortened = true;
+    }
+    if was_shortened {
+        context.content_status =
+            "Текст сокращён до безопасного размера ИИ-запроса; использованы также метаданные файла."
+                .into();
+    }
+}
+
+fn model_batch_ranges(contexts: &[AiFileContext]) -> Vec<Range<usize>> {
+    if contexts.is_empty() {
+        return Vec::new();
+    }
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut current_bytes = 0usize;
+    for (index, context) in contexts.iter().enumerate() {
+        let context_bytes = model_context_bytes(context);
+        let current_count = index.saturating_sub(start);
+        if current_count > 0
+            && (current_count >= AI_BATCH_SIZE
+                || current_bytes.saturating_add(context_bytes) > MAX_BATCH_CONTEXT_BYTES)
+        {
+            ranges.push(start..index);
+            start = index;
+            current_bytes = 0;
+        }
+        current_bytes = current_bytes.saturating_add(context_bytes);
+    }
+    ranges.push(start..contexts.len());
+    ranges
+}
+
+fn anonymized_error(error: &str) -> (String, String) {
+    let (kind, fallback) = if error.contains("Тайм-аут") || error.contains("timed out") {
+        ("timeout", "Модель не ответила в установленное время")
+    } else if error.contains("невалидный JSON") || error.contains("не является JSON")
+    {
+        ("invalid_json", "Ответ модели не является валидным JSON")
+    } else if error.contains("HTTP") {
+        ("http", "API модели вернул ошибку HTTP")
+    } else if error.contains("choices[0].message.content") {
+        (
+            "response_shape",
+            "В ответе модели отсутствует ожидаемое поле",
+        )
+    } else if error.contains("запрос") || error.contains("request") {
+        ("network", "Сетевая ошибка запроса к модели")
+    } else {
+        ("unknown", "Неизвестная техническая ошибка модели")
+    };
+    let mut detail = error.trim().to_string();
+    for marker in [" for url", "http://", "https://", "file://"] {
+        if let Some(index) = detail.find(marker) {
+            detail.truncate(index);
+        }
+    }
+    if detail.contains("/Users/")
+        || detail.contains("/Volumes/")
+        || detail.contains("\\Users\\")
+        || detail.contains("\\\\")
+        || detail.as_bytes().windows(3).any(|part| {
+            part[0].is_ascii_alphabetic() && part[1] == b':' && matches!(part[2], b'\\' | b'/')
+        })
+        || detail.is_empty()
+    {
+        detail = fallback.into();
+    }
+    detail = detail.trim_end_matches([' ', ':', '(', '-']).to_string();
+    if detail.chars().count() > 240 {
+        detail = detail.chars().take(237).collect::<String>() + "…";
+    }
+    (kind.into(), detail)
+}
+
 #[tauri::command]
 fn apply_sort(folder: String, items: Vec<PlanItem>) -> Result<usize, String> {
     let root = canonical_root(&folder)?;
-    let mut records = Vec::new();
-    let mut seen = HashSet::new();
+    ensure_root_writable(&root)?;
+    let mut planned = Vec::new();
+    let mut reserved_destinations = HashSet::new();
+    let mut seen_sources = HashSet::new();
     for item in items {
+        if !item.included {
+            continue;
+        }
         let source = canonical_inside(&root, Path::new(&item.source))?;
         let destination = safe_destination(&root, &item.target)?;
         if source == destination {
             continue;
         }
-        if !seen.insert(destination.clone()) {
-            return Err(format!(
-                "Повторяющийся целевой путь: {}",
-                destination.display()
-            ));
+        if !seen_sources.insert(normalized_path_key(&source)) {
+            return Err("Один исходный файл добавлен в план несколько раз".into());
         }
-        let destination = conflict_free(&destination);
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent).map_err(io_error)?;
-        }
-        fs::rename(&source, &destination).map_err(io_error)?;
-        records.push(MoveRecord {
-            from: source.to_string_lossy().into_owned(),
-            to: destination.to_string_lossy().into_owned(),
+        let destination = conflict_free_reserved(&destination, &mut reserved_destinations);
+        planned.push(PlannedMove {
+            from: source,
+            to: destination,
         });
     }
-    let history = root.join(HISTORY_FILE);
-    fs::write(
-        history,
-        serde_json::to_vec_pretty(&records).map_err(|e| e.to_string())?,
-    )
-    .map_err(io_error)?;
-    Ok(records.len())
+    if planned.is_empty() {
+        return Ok(0);
+    }
+
+    let records: Vec<MoveRecord> = planned
+        .iter()
+        .map(|operation| MoveRecord {
+            from: operation.from.to_string_lossy().into_owned(),
+            to: operation.to.to_string_lossy().into_owned(),
+        })
+        .collect();
+    let history_data = serde_json::to_vec_pretty(&records).map_err(|e| e.to_string())?;
+    let completed = execute_moves(&planned)?;
+    if let Err(error) = write_history(&root, &history_data) {
+        return Err(operation_error_with_rollback(
+            "Не удалось сохранить журнал отмены",
+            &error,
+            &completed,
+        ));
+    }
+    Ok(completed.len())
 }
 
 #[tauri::command]
@@ -395,19 +644,31 @@ fn undo_last_sort(folder: String) -> Result<usize, String> {
     let raw = fs::read(&history).map_err(|_| "Нет операции для отмены".to_string())?;
     let records: Vec<MoveRecord> =
         serde_json::from_slice(&raw).map_err(|_| "Журнал операции повреждён".to_string())?;
-    let mut restored = 0;
+    ensure_root_writable(&root)?;
+    let mut planned = Vec::new();
+    let mut reserved_destinations = HashSet::new();
+    let mut seen_sources = HashSet::new();
     for record in records.into_iter().rev() {
         let current = canonical_inside(&root, Path::new(&record.to))?;
         let original = safe_recorded_destination(&root, Path::new(&record.from))?;
-        let original = conflict_free(&original);
-        if let Some(parent) = original.parent() {
-            fs::create_dir_all(parent).map_err(io_error)?;
+        if !seen_sources.insert(normalized_path_key(&current)) {
+            return Err("Журнал отмены содержит повторяющийся файл".into());
         }
-        fs::rename(current, original).map_err(io_error)?;
-        restored += 1;
+        let original = conflict_free_reserved(&original, &mut reserved_destinations);
+        planned.push(PlannedMove {
+            from: current,
+            to: original,
+        });
     }
-    fs::remove_file(history).map_err(io_error)?;
-    Ok(restored)
+    let completed = execute_moves(&planned)?;
+    if let Err(error) = fs::remove_file(history) {
+        return Err(operation_error_with_rollback(
+            "Не удалось удалить использованный журнал отмены",
+            &error.to_string(),
+            &completed,
+        ));
+    }
+    Ok(completed.len())
 }
 
 #[tauri::command]
@@ -415,7 +676,7 @@ async fn test_connection(ai: AiSettings) -> Result<String, String> {
     if ai.base_url.trim().is_empty() {
         return Err("Укажите базовый URL".into());
     }
-    let url = format!("{}/models", ai.base_url.trim_end_matches('/'));
+    let url = test_connection_url(&ai);
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(8))
@@ -428,11 +689,20 @@ async fn test_connection(ai: AiSettings) -> Result<String, String> {
     let response = tokio::time::timeout(Duration::from_secs(8), request.send())
         .await
         .map_err(|_| "Сервис не ответил за 8 секунд".to_string())?
-        .map_err(|error| format!("Сервис не ответил: {error}"))?;
+        .map_err(|error| anonymized_error(&format!("Сервис не ответил: {error}")).1)?;
     response
         .error_for_status()
-        .map_err(|error| format!("Сервис вернул ошибку: {error}"))?;
-    Ok(format!("Подключение успешно: {}", ai.base_url))
+        .map_err(|error| anonymized_error(&format!("Сервис вернул ошибку HTTP: {error}")).1)?;
+    Ok("Подключение успешно".into())
+}
+
+fn test_connection_url(ai: &AiSettings) -> String {
+    let base_url = ai.base_url.trim_end_matches('/');
+    if ai.provider == "ollama" {
+        format!("{}/api/tags", base_url.trim_end_matches("/v1"))
+    } else {
+        format!("{base_url}/models")
+    }
 }
 
 #[tauri::command]
@@ -465,9 +735,9 @@ async fn list_models(ai: AiSettings) -> Result<ModelList, String> {
     let response = tokio::time::timeout(Duration::from_secs(12), request.send())
         .await
         .map_err(|_| "Список моделей не получен за 12 секунд".to_string())?
-        .map_err(|error| format!("Не удалось получить модели: {error}"))?
+        .map_err(|error| anonymized_error(&format!("Не удалось получить модели: {error}")).1)?
         .error_for_status()
-        .map_err(|error| format!("Сервис вернул ошибку: {error}"))?;
+        .map_err(|error| anonymized_error(&format!("Сервис вернул ошибку HTTP: {error}")).1)?;
     let value: serde_json::Value = response
         .json()
         .await
@@ -542,14 +812,41 @@ fn scan_entry(entry: &walkdir::DirEntry) -> bool {
         return true;
     }
     let name = entry.file_name().to_string_lossy();
+    let normalized = name.to_ascii_lowercase();
     !(entry.file_type().is_dir()
-        && (name == SORTED_DIR || name.to_ascii_lowercase().ends_with(".app")))
+        && (name.eq_ignore_ascii_case(SORTED_DIR)
+            || normalized.ends_with(".app")
+            || normalized == "$recycle.bin"
+            || normalized == "system volume information"))
 }
 fn skip_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if name.starts_with(".ai-file-sorter-") {
+        return true;
+    }
     matches!(
-        path.file_name().and_then(|name| name.to_str()),
-        Some(".DS_Store") | Some(".localized")
+        name.to_ascii_lowercase().as_str(),
+        ".ds_store" | ".localized" | "thumbs.db" | "desktop.ini"
     )
+}
+
+fn is_loopback_endpoint(value: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(value.trim()) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 fn canonical_root(folder: &str) -> Result<PathBuf, String> {
     let path = fs::canonicalize(folder).map_err(io_error)?;
@@ -571,19 +868,20 @@ fn safe_destination(root: &Path, relative: &str) -> Result<PathBuf, String> {
         || p.components().any(|c| {
             matches!(
                 c,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                Component::ParentDir
+                    | Component::RootDir
+                    | Component::Prefix(_)
+                    | Component::CurDir
             )
         })
     {
         return Err("Недопустимый целевой путь".into());
     }
-    if p.components().any(|c| {
-        c.as_os_str()
-            .to_string_lossy()
-            .chars()
-            .any(|ch| matches!(ch, ':' | '*' | '?' | '"' | '<' | '>' | '|'))
-    }) {
-        return Err("Недопустимые символы в имени папки или файла".into());
+    for component in p.components() {
+        let name = component.as_os_str().to_string_lossy();
+        if !windows_compatible_component(&name) {
+            return Err("Имя папки или файла несовместимо с Windows".into());
+        }
     }
     let out = root.join(p);
     if !out.starts_with(root) {
@@ -597,47 +895,199 @@ fn safe_recorded_destination(root: &Path, candidate: &Path) -> Result<PathBuf, S
     }
     if candidate
         .components()
-        .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+        .any(|component| matches!(component, Component::ParentDir))
         || !candidate.starts_with(root)
     {
         return Err("Путь выходит за пределы выбранной папки".into());
     }
     Ok(candidate.to_path_buf())
 }
-fn conflict_free(path: &Path) -> PathBuf {
-    if !path.exists() {
-        return path.to_path_buf();
-    }
+
+fn normalized_path_key(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/").to_lowercase()
+}
+
+fn conflict_free_reserved(path: &Path, reserved: &mut HashSet<String>) -> PathBuf {
     let stem = path.file_stem().and_then(|x| x.to_str()).unwrap_or("file");
     let ext = path
         .extension()
         .and_then(|x| x.to_str())
         .map(|x| format!(".{x}"))
         .unwrap_or_default();
-    for i in 2.. {
-        let candidate = path.with_file_name(format!("{stem} ({i}){ext}"));
-        if !candidate.exists() {
+    for index in 1.. {
+        let candidate = if index == 1 {
+            path.to_path_buf()
+        } else {
+            path.with_file_name(format!("{stem} ({index}){ext}"))
+        };
+        let key = normalized_path_key(&candidate);
+        if !candidate.exists() && reserved.insert(key) {
             return candidate;
         }
     }
     unreachable!()
 }
+
+fn ensure_root_writable(root: &Path) -> Result<(), String> {
+    let probe = root.join(format!(".ai-file-sorter-write-test-{}", Uuid::new_v4()));
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .map_err(|error| {
+            format!(
+                "Выбранная папка или диск недоступны для записи: {error}. Файлы не перемещались"
+            )
+        })?;
+    drop(file);
+    if let Err(error) = fs::remove_file(&probe) {
+        return Err(format!(
+            "Проверочный файл создан, но не удалён: {error}. Сортировка не запускалась"
+        ));
+    }
+    Ok(())
+}
+
+fn execute_moves(planned: &[PlannedMove]) -> Result<Vec<PlannedMove>, String> {
+    let mut completed = Vec::new();
+    for operation in planned {
+        if let Some(parent) = operation.to.parent() {
+            if let Err(error) = fs::create_dir_all(parent) {
+                return Err(operation_error_with_rollback(
+                    "Не удалось создать целевую папку",
+                    &error.to_string(),
+                    &completed,
+                ));
+            }
+        }
+        if operation.to.exists() {
+            return Err(operation_error_with_rollback(
+                "Целевой файл появился после проверки конфликтов",
+                "операция остановлена, чтобы не перезаписать существующий файл",
+                &completed,
+            ));
+        }
+        if let Err(error) = fs::rename(&operation.from, &operation.to) {
+            return Err(operation_error_with_rollback(
+                "Не удалось переместить файл",
+                &error.to_string(),
+                &completed,
+            ));
+        }
+        completed.push(operation.clone());
+    }
+    Ok(completed)
+}
+
+fn rollback_moves(completed: &[PlannedMove]) -> Result<(), String> {
+    let mut failures = 0usize;
+    for operation in completed.iter().rev() {
+        if operation.from.exists() || !operation.to.exists() {
+            failures += 1;
+            continue;
+        }
+        if let Some(parent) = operation.from.parent() {
+            if fs::create_dir_all(parent).is_err() {
+                failures += 1;
+                continue;
+            }
+        }
+        if fs::rename(&operation.to, &operation.from).is_err() {
+            failures += 1;
+        }
+    }
+    if failures == 0 {
+        Ok(())
+    } else {
+        Err(format!("не удалось вернуть файлов: {failures}"))
+    }
+}
+
+fn operation_error_with_rollback(context: &str, error: &str, completed: &[PlannedMove]) -> String {
+    if completed.is_empty() {
+        return format!("{context}: {error}. Файлы не перемещались");
+    }
+    match rollback_moves(completed) {
+        Ok(()) => format!("{context}: {error}. Уже перемещённые файлы возвращены обратно"),
+        Err(rollback_error) => format!(
+            "{context}: {error}. ВНИМАНИЕ: автоматический откат выполнен не полностью ({rollback_error})"
+        ),
+    }
+}
+
+fn write_history(root: &Path, data: &[u8]) -> Result<(), String> {
+    let history = root.join(HISTORY_FILE);
+    let temporary = root.join(format!("{HISTORY_FILE}.{}.tmp", Uuid::new_v4()));
+    let backup = root.join(format!("{HISTORY_FILE}.{}.bak", Uuid::new_v4()));
+    fs::write(&temporary, data).map_err(io_error)?;
+
+    let had_history = history.exists();
+    if had_history {
+        if let Err(error) = fs::rename(&history, &backup) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error.to_string());
+        }
+    }
+    if let Err(error) = fs::rename(&temporary, &history) {
+        if had_history {
+            let _ = fs::rename(&backup, &history);
+        }
+        let _ = fs::remove_file(&temporary);
+        return Err(error.to_string());
+    }
+    if had_history {
+        let _ = fs::remove_file(backup);
+    }
+    Ok(())
+}
+
 fn io_error(e: std::io::Error) -> String {
     e.to_string()
 }
+
+fn is_windows_reserved_name(value: &str) -> bool {
+    let stem = value
+        .split('.')
+        .next()
+        .unwrap_or(value)
+        .to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || stem
+            .strip_prefix("COM")
+            .or_else(|| stem.strip_prefix("LPT"))
+            .is_some_and(|number| {
+                matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+            })
+}
+
+fn windows_compatible_component(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && !value.ends_with([' ', '.'])
+        && !is_windows_reserved_name(value)
+        && !value.chars().any(|ch| {
+            ch.is_control() || matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+        })
+}
+
 fn safe_name(value: &str) -> String {
     let clean: String = value
         .chars()
         .map(|c| {
-            if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+            if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
                 '_'
             } else {
                 c
             }
         })
+        .take(80)
         .collect();
-    if clean.trim().is_empty() {
+    let clean = clean.trim().trim_end_matches('.').trim_end().to_string();
+    if clean.is_empty() || clean == "." || clean == ".." {
         "Прочее".into()
+    } else if is_windows_reserved_name(&clean) {
+        format!("_{clean}")
     } else {
         clean
     }
@@ -702,8 +1152,19 @@ fn read_text_preview(path: &Path, ext: &str, limit: usize) -> (Option<String>, S
             "Достигнут общий лимит текста; использованы метаданные файла.".into(),
         );
     }
-    match fs::read_to_string(path) {
-        Ok(text) => {
+    let max_bytes = if limit == usize::MAX {
+        u64::MAX
+    } else {
+        u64::try_from(limit.saturating_mul(4).saturating_add(4)).unwrap_or(u64::MAX)
+    };
+    let mut bytes = Vec::new();
+    let read_result = fs::File::open(path).and_then(|file| {
+        let mut reader = file.take(max_bytes);
+        reader.read_to_end(&mut bytes)
+    });
+    match read_result {
+        Ok(_) => {
+            let text = String::from_utf8_lossy(&bytes);
             let excerpt: String = text.chars().take(limit).collect();
             if excerpt.is_empty() {
                 (
@@ -798,18 +1259,20 @@ enum BatchError {
     Cancelled,
 }
 
-async fn refine_with_model<P>(
+async fn refine_with_model<P, L>(
     client: &reqwest::Client,
     ai: &AiSettings,
     sort: &SortSettings,
     items: &mut [PlanItem],
     contexts: &[AiFileContext],
     cancelled: Arc<AtomicBool>,
-    progress: P,
+    observers: (P, L),
 ) -> Result<AiRefinement, String>
 where
     P: FnMut(AnalysisProgress),
+    L: FnMut(AnalysisLogEvent),
 {
+    let (progress, log_event) = observers;
     let request_cancelled = cancelled.clone();
     refine_in_batches(
         sort,
@@ -826,6 +1289,7 @@ where
             )
         },
         progress,
+        log_event,
     )
     .await
 }
@@ -841,31 +1305,42 @@ async fn request_model_batch(
     if cancelled.load(Ordering::Acquire) {
         return Err(BatchError::Cancelled);
     }
+    let context_bytes = model_batch_context_bytes(&batch);
+    if context_bytes > MAX_BATCH_CONTEXT_BYTES {
+        return Err(BatchError::Failure(format!(
+            "Входной контекст пакета ({context_bytes} байт) превышает безопасный лимит {MAX_BATCH_CONTEXT_BYTES} байт."
+        )));
+    }
     let instruction = if sort.mode == "custom" {
         sort.custom_prompt.as_str()
     } else {
         "Используй только категории: Работа, Личное, Финансы, Учёба, Медиа, Архив, Загрузчики, Прочее. Установочные файлы с расширениями DMG, EXE, PKG, MSI и похожими всегда относятся к Загрузчикам."
     };
-    let url = format!("{}/chat/completions", ai.base_url.trim_end_matches('/'));
+    let url = chat_completions_url(ai);
     let prompt = format!("Классифицируй только этот небольшой пакет файлов. Инструкция: {instruction}\nДля каждого файла сначала используй contentExtract, если он есть. Если его нет, анализируй только метаданные: path, extension, sizeBytes, даты и suggestedCategory. Не выдумывай содержимое. Верни ТОЛЬКО JSON-массив объектов {{id, category, explanation, confidence}}. Верни ровно одно решение для каждого переданного id. category — короткое безопасное имя папки без / и \\.\nФайлы: {}", serde_json::to_string(&batch).map_err(|error| BatchError::Failure(error.to_string()))?);
-    let body = serde_json::json!({"model":ai.model,"temperature":0,"messages":[{"role":"system","content":"Ты отвечаешь строго валидным JSON без Markdown."},{"role":"user","content":prompt}]});
+    let body = serde_json::json!({"model":ai.model,"temperature":0,"max_tokens":MAX_MODEL_RESPONSE_TOKENS,"messages":[{"role":"system","content":"Ты отвечаешь строго валидным JSON без Markdown."},{"role":"user","content":prompt}]});
     let mut request = client.post(&url).json(&body);
     if !ai.api_key.trim().is_empty() {
         request = request.bearer_auth(&ai.api_key);
     }
-    let operation = async {
-        let response = request
-            .send()
-            .await
-            .map_err(|error| BatchError::Failure(format!("Ошибка запроса к модели: {error}")))?
-            .error_for_status()
-            .map_err(|error| BatchError::Failure(format!("Модель вернула ошибку HTTP: {error}")))?;
-        let value: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|error| BatchError::Failure(format!("Ответ API не является JSON: {error}")))?;
-        parse_model_response(&value).map_err(BatchError::Failure)
-    };
+    let operation =
+        async {
+            let response = request.send().await.map_err(|error| {
+                BatchError::Failure(format!("Ошибка запроса к модели: {error}"))
+            })?;
+            let status = response.status();
+            if !status.is_success() {
+                let response_body = response.text().await.unwrap_or_default();
+                return Err(BatchError::Failure(model_http_error(
+                    status,
+                    &response_body,
+                )));
+            }
+            let value: serde_json::Value = response.json().await.map_err(|error| {
+                BatchError::Failure(format!("Ответ API не является JSON: {error}"))
+            })?;
+            parse_model_response(&value).map_err(BatchError::Failure)
+        };
 
     tokio::select! {
         _ = wait_for_cancellation(cancelled) => Err(BatchError::Cancelled),
@@ -876,6 +1351,48 @@ async fn request_model_batch(
             )))?
         }
     }
+}
+
+fn chat_completions_url(ai: &AiSettings) -> String {
+    let base_url = ai.base_url.trim_end_matches('/');
+    if ai.provider == "ollama" && !base_url.ends_with("/v1") {
+        format!("{base_url}/v1/chat/completions")
+    } else {
+        format!("{base_url}/chat/completions")
+    }
+}
+
+fn model_http_error(status: reqwest::StatusCode, response_body: &str) -> String {
+    let body = response_body.to_lowercase();
+    let reason = if ["context", "token", "max_tokens", "context_length"]
+        .iter()
+        .any(|marker| body.contains(marker))
+    {
+        "запрос превышает доступный контекст модели"
+    } else if [
+        "payload",
+        "request too large",
+        "body too large",
+        "too large",
+    ]
+    .iter()
+    .any(|marker| body.contains(marker))
+    {
+        "запрос слишком большой для API модели"
+    } else if ["model not found", "unknown model", "model is not loaded"]
+        .iter()
+        .any(|marker| body.contains(marker))
+    {
+        "выбранная модель не найдена или не загружена"
+    } else if ["api key", "unauthorized", "authentication", "forbidden"]
+        .iter()
+        .any(|marker| body.contains(marker))
+    {
+        "API отклонил авторизацию"
+    } else {
+        "API отклонил запрос; подробности ответа скрыты для конфиденциальности"
+    };
+    format!("Модель вернула HTTP {status}: {reason}.")
 }
 
 async fn wait_for_cancellation(cancelled: Arc<AtomicBool>) {
@@ -902,17 +1419,51 @@ fn parse_model_response(value: &serde_json::Value) -> Result<Vec<AiDecision>, St
     serde_json::from_str(json).map_err(|error| format!("Модель вернула невалидный JSON: {error}"))
 }
 
-async fn refine_in_batches<F, Fut, P>(
+#[allow(clippy::too_many_arguments)]
+fn batch_log_event(
+    phase: &str,
+    attempt: usize,
+    batch_number: usize,
+    total_batches: usize,
+    batch: &[AiFileContext],
+    started: Instant,
+    outcome: &str,
+    successful_files: usize,
+    unresolved_files: usize,
+    error_kind: Option<String>,
+    error_detail: Option<String>,
+) -> AnalysisLogEvent {
+    AnalysisLogEvent {
+        phase: phase.into(),
+        attempt: Some(attempt),
+        batch_number: Some(batch_number),
+        total_batches: Some(total_batches),
+        file_count: batch.len(),
+        extensions: extension_summary(batch),
+        duration_ms: elapsed_ms(started),
+        outcome: outcome.into(),
+        successful_files,
+        unresolved_files,
+        skipped_files: 0,
+        input_bytes: Some(model_batch_context_bytes(batch)),
+        error_kind,
+        error_detail,
+    }
+}
+
+async fn refine_in_batches<F, Fut, P, L>(
     sort: &SortSettings,
     items: &mut [PlanItem],
     contexts: &[AiFileContext],
     mut request_batch: F,
     mut progress: P,
+    mut log_event: L,
 ) -> Result<AiRefinement, String>
 where
     F: FnMut(Vec<AiFileContext>) -> Fut,
     Fut: Future<Output = Result<Vec<AiDecision>, BatchError>>,
     P: FnMut(AnalysisProgress),
+    L: FnMut(AnalysisLogEvent),
 {
     if items.is_empty() {
         progress(AnalysisProgress {
@@ -921,26 +1472,36 @@ where
             total_batches: 0,
             processed_files: 0,
             pending_files: 0,
+            not_attempted_files: 0,
+            retry_pending_files: 0,
             message: "В выбранной папке нет файлов для анализа.".into(),
         });
         return Ok(AiRefinement::default());
     }
     let mut result = AiRefinement::default();
     let mut first_failures = HashMap::<String, String>::new();
-    let main_batches = contexts.len().div_ceil(AI_BATCH_SIZE);
+    let main_batch_ranges = model_batch_ranges(contexts);
+    let main_batches = main_batch_ranges.len();
+    let mut attempted_main_files = 0usize;
 
-    for (index, batch) in contexts.chunks(AI_BATCH_SIZE).enumerate() {
+    for (index, range) in main_batch_ranges.iter().enumerate() {
+        let batch = &contexts[range.clone()];
+        let not_attempted_before = contexts.len().saturating_sub(attempted_main_files);
         progress(AnalysisProgress {
             phase: "main".into(),
             completed_batches: index,
             total_batches: main_batches,
             processed_files: processed_count(items),
-            pending_files: retry_pending_count(items),
+            pending_files: not_attempted_before + first_failures.len(),
+            not_attempted_files: not_attempted_before,
+            retry_pending_files: first_failures.len(),
             message: format!("Основной проход: пакет {} из {main_batches}…", index + 1),
         });
+        let batch_started = Instant::now();
         match request_batch(batch.to_vec()).await {
             Ok(decisions) => {
                 let missing = apply_batch_decisions(sort, items, batch, decisions);
+                let successful = batch.len() - missing.len();
                 if !missing.is_empty() {
                     let reason = "Модель вернула частичный ответ: решение для файла отсутствует."
                         .to_string();
@@ -949,21 +1510,72 @@ where
                     }
                     result.warnings.push(format!("Основной проход, пакет {}: модель не вернула решения для {} файлов; они отправлены на повторную попытку.", index + 1, missing.len()));
                 }
+                log_event(batch_log_event(
+                    "main",
+                    1,
+                    index + 1,
+                    main_batches,
+                    batch,
+                    batch_started,
+                    if missing.is_empty() {
+                        "success"
+                    } else {
+                        "partial"
+                    },
+                    successful,
+                    missing.len(),
+                    (!missing.is_empty()).then(|| "partial_response".into()),
+                    (!missing.is_empty())
+                        .then(|| "Модель не вернула решения для части файлов пакета".into()),
+                ));
             }
             Err(BatchError::Failure(error)) => {
+                let (error_kind, error_detail) = anonymized_error(&error);
                 for context in batch {
-                    first_failures.insert(context.id.clone(), error.clone());
+                    first_failures.insert(context.id.clone(), error_detail.clone());
                 }
-                result.warnings.push(format!("Основной проход, пакет {}: {error}. На повторную попытку отправлено {} файлов.", index + 1, batch.len()));
+                result.warnings.push(format!("Основной проход, пакет {}: {error_detail}. На повторную попытку отправлено {} файлов.", index + 1, batch.len()));
+                log_event(batch_log_event(
+                    "main",
+                    1,
+                    index + 1,
+                    main_batches,
+                    batch,
+                    batch_started,
+                    "error",
+                    0,
+                    batch.len(),
+                    Some(error_kind),
+                    Some(error_detail),
+                ));
             }
-            Err(BatchError::Cancelled) => return Err("Анализ отменён пользователем".into()),
+            Err(BatchError::Cancelled) => {
+                log_event(batch_log_event(
+                    "main",
+                    1,
+                    index + 1,
+                    main_batches,
+                    batch,
+                    batch_started,
+                    "cancelled",
+                    0,
+                    batch.len(),
+                    Some("cancelled".into()),
+                    Some("Анализ отменён пользователем".into()),
+                ));
+                return Err("Анализ отменён пользователем".into());
+            }
         }
+        attempted_main_files = attempted_main_files.saturating_add(batch.len());
+        let not_attempted_after = contexts.len().saturating_sub(attempted_main_files);
         progress(AnalysisProgress {
             phase: "main".into(),
             completed_batches: index + 1,
             total_batches: main_batches,
             processed_files: processed_count(items),
-            pending_files: retry_pending_count(items),
+            pending_files: not_attempted_after + first_failures.len(),
+            not_attempted_files: not_attempted_after,
+            retry_pending_files: first_failures.len(),
             message: format!(
                 "Основной проход: завершено пакетов {} из {main_batches}.",
                 index + 1
@@ -976,20 +1588,26 @@ where
         .filter(|context| item_status(items, &context.id) == Some(AiStatus::RetryPending))
         .cloned()
         .collect();
-    let retry_batches = retry_contexts.len().div_ceil(AI_BATCH_SIZE);
-    for (index, batch) in retry_contexts.chunks(AI_BATCH_SIZE).enumerate() {
+    let retry_batch_ranges = model_batch_ranges(&retry_contexts);
+    let retry_batches = retry_batch_ranges.len();
+    for (index, range) in retry_batch_ranges.iter().enumerate() {
+        let batch = &retry_contexts[range.clone()];
         progress(AnalysisProgress {
             phase: "retry".into(),
             completed_batches: index,
             total_batches: retry_batches,
             processed_files: processed_count(items),
             pending_files: retry_pending_count(items),
+            not_attempted_files: 0,
+            retry_pending_files: retry_pending_count(items),
             message: format!("Повторный проход: пакет {} из {retry_batches}…", index + 1),
         });
+        let batch_started = Instant::now();
         match request_batch(batch.to_vec()).await {
             Ok(decisions) => {
                 let missing = apply_batch_decisions(sort, items, batch, decisions);
-                result.summary.retry_succeeded += batch.len() - missing.len();
+                let successful = batch.len() - missing.len();
+                result.summary.retry_succeeded += successful;
                 if !missing.is_empty() {
                     let reason =
                         "Модель снова вернула частичный ответ: решение для файла отсутствует.";
@@ -998,19 +1616,72 @@ where
                     }
                     result.warnings.push(format!("Повторный проход, пакет {}: для {} файлов снова нет решения; они направлены в «{}».", index + 1, missing.len(), UNPROCESSED_CATEGORY));
                 }
+                log_event(batch_log_event(
+                    "retry",
+                    2,
+                    index + 1,
+                    retry_batches,
+                    batch,
+                    batch_started,
+                    if missing.is_empty() {
+                        "success"
+                    } else {
+                        "partial"
+                    },
+                    successful,
+                    missing.len(),
+                    (!missing.is_empty()).then(|| "partial_response".into()),
+                    (!missing.is_empty()).then(|| {
+                        "Модель повторно не вернула решения для части файлов пакета".into()
+                    }),
+                ));
             }
             Err(BatchError::Failure(error)) => {
+                let (error_kind, error_detail) = anonymized_error(&error);
                 for context in batch {
-                    mark_unprocessed(items, &context.id, first_failures.get(&context.id), &error);
+                    mark_unprocessed(
+                        items,
+                        &context.id,
+                        first_failures.get(&context.id),
+                        &error_detail,
+                    );
                 }
                 result.warnings.push(format!(
-                    "Повторный проход, пакет {}: {error}. В «{}» направлено {} файлов.",
+                    "Повторный проход, пакет {}: {error_detail}. В «{}» направлено {} файлов.",
                     index + 1,
                     UNPROCESSED_CATEGORY,
                     batch.len()
                 ));
+                log_event(batch_log_event(
+                    "retry",
+                    2,
+                    index + 1,
+                    retry_batches,
+                    batch,
+                    batch_started,
+                    "error",
+                    0,
+                    batch.len(),
+                    Some(error_kind),
+                    Some(error_detail),
+                ));
             }
-            Err(BatchError::Cancelled) => return Err("Анализ отменён пользователем".into()),
+            Err(BatchError::Cancelled) => {
+                log_event(batch_log_event(
+                    "retry",
+                    2,
+                    index + 1,
+                    retry_batches,
+                    batch,
+                    batch_started,
+                    "cancelled",
+                    0,
+                    batch.len(),
+                    Some("cancelled".into()),
+                    Some("Анализ отменён пользователем".into()),
+                ));
+                return Err("Анализ отменён пользователем".into());
+            }
         }
         progress(AnalysisProgress {
             phase: "retry".into(),
@@ -1018,6 +1689,8 @@ where
             total_batches: retry_batches,
             processed_files: processed_count(items),
             pending_files: retry_pending_count(items),
+            not_attempted_files: 0,
+            retry_pending_files: retry_pending_count(items),
             message: format!(
                 "Повторный проход: завершено пакетов {} из {retry_batches}.",
                 index + 1
@@ -1039,6 +1712,8 @@ where
         total_batches: main_batches + retry_batches,
         processed_files: result.summary.ai_processed,
         pending_files: 0,
+        not_attempted_files: 0,
+        retry_pending_files: 0,
         message: format!(
             "Анализ завершён: ИИ обработал {}, после повтора — {}, не обработано — {}.",
             result.summary.ai_processed,
@@ -1236,6 +1911,7 @@ mod tests {
                 std::future::ready(Ok(decisions(&batch)))
             },
             |_| {},
+            |_| {},
         )
         .await
         .unwrap();
@@ -1271,6 +1947,7 @@ mod tests {
                 std::future::ready(response)
             },
             |_| {},
+            |_| {},
         )
         .await
         .unwrap();
@@ -1305,6 +1982,7 @@ mod tests {
                 std::future::ready(response)
             },
             |_| {},
+            |_| {},
         )
         .await
         .unwrap();
@@ -1322,9 +2000,10 @@ mod tests {
         for item in &items[10..] {
             assert_eq!(item.ai_status, AiStatus::Unprocessed);
             assert_eq!(item.category, UNPROCESSED_CATEGORY);
-            assert!(item
-                .target
-                .starts_with("AI Sorted/Не обработано ИИ/Текст/2026/08/исходная/папка/"));
+            let expected_parent = PathBuf::from(SORTED_DIR)
+                .join(UNPROCESSED_CATEGORY)
+                .join("Текст/2026/08/исходная/папка");
+            assert!(Path::new(&item.target).starts_with(expected_parent));
             assert!(item.included);
             let error = item.ai_error.as_deref().unwrap();
             assert!(error.contains("Тайм-аут запроса"));
@@ -1349,6 +2028,7 @@ mod tests {
                 };
                 std::future::ready(response)
             },
+            |_| {},
             |_| {},
         )
         .await
@@ -1375,6 +2055,136 @@ mod tests {
         assert!(parse_model_response(&value)
             .unwrap_err()
             .contains("невалидный JSON"));
+    }
+
+    #[test]
+    fn diagnostic_errors_hide_urls_and_local_paths() {
+        let (_, url_detail) = anonymized_error(
+            "Модель вернула ошибку HTTP: 400 Bad Request for url (http://127.0.0.1:1234/v1/chat/completions)",
+        );
+        assert!(url_detail.contains("400 Bad Request"));
+        assert!(!url_detail.contains("http://"));
+
+        let (_, path_detail) =
+            anonymized_error("Ошибка запроса к модели: /Users/private/Documents/secret-file.txt");
+        assert_eq!(path_detail, "Сетевая ошибка запроса к модели");
+        assert!(!path_detail.contains("secret-file"));
+    }
+
+    #[test]
+    fn context_error_is_useful_without_exposing_server_response() {
+        let error = model_http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"context length 12000 exceeds 4096 for /Users/private/secret.txt"}}"#,
+        );
+        assert!(error.contains("превышает доступный контекст"));
+        assert!(!error.contains("secret.txt"));
+        assert!(!error.contains("/Users/"));
+    }
+
+    #[test]
+    fn ollama_uses_its_openai_compatible_chat_endpoint() {
+        let ai = AiSettings {
+            provider: "ollama".into(),
+            base_url: "http://127.0.0.1:11434".into(),
+            model: "test".into(),
+            api_key: String::new(),
+            cloud_consent: false,
+        };
+        assert_eq!(
+            chat_completions_url(&ai),
+            "http://127.0.0.1:11434/v1/chat/completions"
+        );
+        assert_eq!(test_connection_url(&ai), "http://127.0.0.1:11434/api/tags");
+    }
+
+    #[test]
+    fn contexts_are_split_by_payload_size_and_file_count() {
+        let (_, mut contexts) = plan(5);
+        for context in &mut contexts {
+            context.content_extract = Some("a".repeat(3_800));
+            fit_context_into_model_budget(context);
+        }
+        let ranges = model_batch_ranges(&contexts);
+        assert!(ranges.len() > 1);
+        for range in ranges {
+            let batch = &contexts[range];
+            assert!(batch.len() <= AI_BATCH_SIZE);
+            assert!(model_batch_context_bytes(batch) <= MAX_BATCH_CONTEXT_BYTES);
+        }
+    }
+
+    #[test]
+    fn oversized_context_text_is_trimmed_before_request() {
+        let (_, mut contexts) = plan(1);
+        contexts[0].content_extract = Some("a".repeat(MAX_BATCH_CONTEXT_BYTES * 2));
+        fit_context_into_model_budget(&mut contexts[0]);
+        assert!(model_context_bytes(&contexts[0]) <= MAX_BATCH_CONTEXT_BYTES);
+        assert!(contexts[0].content_status.contains("сокращён"));
+    }
+
+    #[test]
+    fn extension_summary_contains_no_file_names_or_paths() {
+        let (_, mut contexts) = plan(3);
+        contexts[0].extension = "PDF".into();
+        contexts[1].extension = "pdf".into();
+        contexts[2].extension.clear();
+        let summary = extension_summary(&contexts);
+        assert_eq!(
+            summary,
+            vec![
+                ExtensionCount {
+                    extension: ".pdf".into(),
+                    count: 2,
+                },
+                ExtensionCount {
+                    extension: "без расширения".into(),
+                    count: 1,
+                },
+            ]
+        );
+        let serialized = serde_json::to_string(&summary).unwrap();
+        assert!(!serialized.contains("исходная"));
+        assert!(!serialized.contains("file-"));
+    }
+
+    #[tokio::test]
+    async fn batch_diagnostics_report_attempts_extensions_and_separate_counts() {
+        let (mut items, mut contexts) = plan(12);
+        contexts[0].extension = "pdf".into();
+        contexts[1].extension = "pdf".into();
+        let mut progress_events = Vec::new();
+        let mut log_events = Vec::new();
+        refine_in_batches(
+            &test_sort(),
+            &mut items,
+            &contexts,
+            |batch| std::future::ready(Ok(decisions(&batch))),
+            |progress| progress_events.push(progress),
+            |event| log_events.push(event),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(log_events.len(), 2);
+        assert_eq!(log_events[0].attempt, Some(1));
+        assert_eq!(log_events[0].batch_number, Some(1));
+        assert_eq!(log_events[0].file_count, 10);
+        assert_eq!(log_events[0].outcome, "success");
+        assert_eq!(log_events[0].successful_files, 10);
+        assert!(log_events[0].extensions.contains(&ExtensionCount {
+            extension: ".pdf".into(),
+            count: 2,
+        }));
+
+        let after_first_batch = progress_events
+            .iter()
+            .find(|progress| progress.phase == "main" && progress.completed_batches == 1)
+            .unwrap();
+        assert_eq!(after_first_batch.processed_files, 10);
+        assert_eq!(after_first_batch.not_attempted_files, 2);
+        assert_eq!(after_first_batch.retry_pending_files, 0);
+        assert_eq!(after_first_batch.pending_files, 2);
     }
 
     #[tokio::test]
@@ -1558,14 +2368,27 @@ mod tests {
         let root = std::env::temp_dir().join(format!("ai-file-sorter-scan-{}", Uuid::new_v4()));
         fs::create_dir_all(root.join("AI Sorted/old")).unwrap();
         fs::create_dir_all(root.join("Example.app/Contents")).unwrap();
+        fs::create_dir_all(root.join("$RECYCLE.BIN/trash")).unwrap();
+        fs::create_dir_all(root.join("System Volume Information/index")).unwrap();
         fs::write(root.join("keep.txt"), "keep").unwrap();
+        fs::write(root.join("Thumbs.db"), "skip").unwrap();
+        fs::write(root.join("desktop.ini"), "skip").unwrap();
+        fs::write(root.join(HISTORY_FILE), "skip").unwrap();
+        fs::write(root.join(".ai-file-sorter-last-operation.test.bak"), "skip").unwrap();
         fs::write(root.join("AI Sorted/old/skip.txt"), "skip").unwrap();
         fs::write(root.join("Example.app/Contents/skip.txt"), "skip").unwrap();
+        fs::write(root.join("$RECYCLE.BIN/trash/skip.txt"), "skip").unwrap();
+        fs::write(
+            root.join("System Volume Information/index/skip.txt"),
+            "skip",
+        )
+        .unwrap();
         let files: Vec<PathBuf> = WalkDir::new(&root)
             .into_iter()
             .filter_entry(scan_entry)
             .filter_map(Result::ok)
             .filter(|entry| entry.file_type().is_file())
+            .filter(|entry| !skip_file(entry.path()))
             .map(|entry| entry.into_path())
             .collect();
         assert_eq!(files, vec![root.join("keep.txt")]);
@@ -1575,6 +2398,134 @@ mod tests {
     #[test]
     fn names_are_sanitized() {
         assert_eq!(safe_name("A/B: C"), "A_B_ C");
+        assert_eq!(safe_name("CON"), "_CON");
+        assert_eq!(safe_name("nul.txt"), "_nul.txt");
+        assert_eq!(safe_name("Категория.   "), "Категория");
+        assert_eq!(safe_name(".."), "Прочее");
+        assert!(safe_name(&"a".repeat(200)).chars().count() <= 80);
+    }
+
+    #[test]
+    fn windows_incompatible_target_components_are_rejected() {
+        let root = Path::new("/tmp/root");
+        assert!(safe_destination(root, "AI Sorted/CON/file.txt").is_err());
+        assert!(safe_destination(root, "AI Sorted/Работа./file.txt").is_err());
+        assert!(safe_destination(root, "AI Sorted/Работа/file?.txt").is_err());
+    }
+
+    #[test]
+    fn only_real_loopback_hosts_bypass_cloud_consent() {
+        assert!(is_loopback_endpoint("http://localhost:1234/v1"));
+        assert!(is_loopback_endpoint("http://127.0.0.1:11434"));
+        assert!(is_loopback_endpoint("http://127.12.34.56:11434"));
+        assert!(is_loopback_endpoint("http://[::1]:1234/v1"));
+        assert!(!is_loopback_endpoint("https://example.com/?next=localhost"));
+        assert!(!is_loopback_endpoint("https://localhost.example.com/v1"));
+        assert!(!is_loopback_endpoint("not a URL containing localhost"));
+    }
+
+    #[test]
+    fn planned_destinations_are_reserved_case_insensitively() {
+        let mut reserved = HashSet::new();
+        let root = std::env::temp_dir().join(format!("ai-file-sorter-case-{}", Uuid::new_v4()));
+        let first = conflict_free_reserved(&root.join("Report.txt"), &mut reserved);
+        let second = conflict_free_reserved(&root.join("report.txt"), &mut reserved);
+        assert_eq!(first.file_name().unwrap(), "Report.txt");
+        assert_eq!(second.file_name().unwrap(), "report (2).txt");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_absolute_history_paths_stay_inside_root() {
+        let root = Path::new(r"C:\Selected");
+        assert_eq!(
+            safe_recorded_destination(root, Path::new(r"C:\Selected\incoming\file.txt")).unwrap(),
+            PathBuf::from(r"C:\Selected\incoming\file.txt")
+        );
+        assert!(safe_recorded_destination(root, Path::new(r"D:\outside\file.txt")).is_err());
+    }
+
+    #[test]
+    fn apply_rolls_back_files_when_a_later_move_fails() {
+        let root = std::env::temp_dir().join(format!("ai-file-sorter-rollback-{}", Uuid::new_v4()));
+        let first = root.join("incoming/first.txt");
+        let second = root.join("incoming/second.txt");
+        fs::create_dir_all(first.parent().unwrap()).unwrap();
+        fs::write(&first, "first").unwrap();
+        fs::write(&second, "second").unwrap();
+        fs::write(root.join("blocked"), "not a directory").unwrap();
+        let items = vec![
+            PlanItem {
+                id: "first".into(),
+                source: first.to_string_lossy().into_owned(),
+                relative_path: "incoming/first.txt".into(),
+                target: "AI Sorted/Работа/first.txt".into(),
+                category: "Работа".into(),
+                explanation: "test".into(),
+                confidence: 1.0,
+                included: true,
+                warning: None,
+                ai_status: AiStatus::Processed,
+                ai_error: None,
+            },
+            PlanItem {
+                id: "second".into(),
+                source: second.to_string_lossy().into_owned(),
+                relative_path: "incoming/second.txt".into(),
+                target: "blocked/sub/second.txt".into(),
+                category: "Работа".into(),
+                explanation: "test".into(),
+                confidence: 1.0,
+                included: true,
+                warning: None,
+                ai_status: AiStatus::Processed,
+                ai_error: None,
+            },
+        ];
+        let error = apply_sort(root.to_string_lossy().into_owned(), items).unwrap_err();
+        assert!(error.contains("возвращены обратно"), "{error}");
+        assert_eq!(fs::read_to_string(&first).unwrap(), "first");
+        assert_eq!(fs::read_to_string(&second).unwrap(), "second");
+        assert!(!root.join(HISTORY_FILE).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn undo_rolls_back_restores_when_a_later_restore_fails() {
+        let root =
+            std::env::temp_dir().join(format!("ai-file-sorter-undo-rollback-{}", Uuid::new_v4()));
+        let current_first = root.join("AI Sorted/first.txt");
+        let current_second = root.join("AI Sorted/second.txt");
+        fs::create_dir_all(current_first.parent().unwrap()).unwrap();
+        fs::write(&current_first, "first").unwrap();
+        fs::write(&current_second, "second").unwrap();
+        fs::write(root.join("blocked"), "not a directory").unwrap();
+        let canonical = fs::canonicalize(&root).unwrap();
+        let original_first = canonical.join("incoming/first.txt");
+        let original_second = canonical.join("blocked/sub/second.txt");
+        let records = vec![
+            MoveRecord {
+                from: original_second.to_string_lossy().into_owned(),
+                to: current_second.to_string_lossy().into_owned(),
+            },
+            MoveRecord {
+                from: original_first.to_string_lossy().into_owned(),
+                to: current_first.to_string_lossy().into_owned(),
+            },
+        ];
+        fs::write(
+            root.join(HISTORY_FILE),
+            serde_json::to_vec(&records).unwrap(),
+        )
+        .unwrap();
+
+        let error = undo_last_sort(root.to_string_lossy().into_owned()).unwrap_err();
+        assert!(error.contains("возвращены обратно"), "{error}");
+        assert_eq!(fs::read_to_string(&current_first).unwrap(), "first");
+        assert_eq!(fs::read_to_string(&current_second).unwrap(), "second");
+        assert!(!original_first.exists());
+        assert!(root.join(HISTORY_FILE).exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1583,6 +2534,51 @@ mod tests {
             classify(Path::new("tax_invoice.pdf"), "pdf", &test_sort()).0,
             "Финансы"
         );
+    }
+
+    #[test]
+    fn text_preview_respects_character_limit_without_reading_the_whole_file() {
+        let path = std::env::temp_dir().join(format!("ai-file-sorter-text-{}.txt", Uuid::new_v4()));
+        fs::write(&path, "😀😀😀😀😀секретный хвост").unwrap();
+        let (preview, status) = read_text_preview(&path, "txt", 5);
+        assert_eq!(preview.as_deref(), Some("😀😀😀😀😀"));
+        assert!(status.contains("фрагмент"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn unlimited_mode_keeps_each_text_extract_bounded() {
+        let root =
+            std::env::temp_dir().join(format!("ai-file-sorter-unlimited-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("large.txt"),
+            "a".repeat(MAX_TEXT_CHARS_PER_FILE * 4),
+        )
+        .unwrap();
+        let sort = SortSettings {
+            mode: "standard".into(),
+            custom_prompt: String::new(),
+            text_limit: usize::MAX,
+            total_limit: usize::MAX,
+            unlimited: true,
+        };
+        let prepared = prepare_analysis(
+            root.to_string_lossy().into_owned(),
+            &sort,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(prepared.contexts.len(), 1);
+        assert!(prepared.contexts[0]
+            .content_extract
+            .as_ref()
+            .is_some_and(|text| text.chars().count() <= MAX_TEXT_CHARS_PER_FILE));
+        assert!(prepared
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Без общего лимита")));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
