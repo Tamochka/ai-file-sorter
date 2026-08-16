@@ -44,7 +44,7 @@ npm run tauri build
 
 ### Windows x64
 
-Нативный Windows-установщик собирается в GitHub Actions процессом `Windows x64 build`. После успешного запуска скачайте артефакт `AI-File-Sorter-v0.2.2-Windows-x64`: внутри находятся NSIS-установщик `*-setup.exe`, переносимый `ai-file-sorter.exe` и файл контрольной суммы `SHA256SUMS.txt`.
+Нативный Windows-установщик собирается в GitHub Actions процессом `Windows x64 build`. После успешного запуска скачайте артефакт `AI-File-Sorter-v0.2.3-Windows-x64`: внутри находятся NSIS-установщик `*-setup.exe`, переносимый `ai-file-sorter.exe` и файл контрольной суммы `SHA256SUMS.txt`.
 
 Windows 10 (версия 1803 и новее) и Windows 11 обычно уже содержат WebView2. Установщик не подписан коммерческим сертификатом, поэтому Microsoft Defender SmartScreen может показать предупреждение неизвестного издателя.
 
