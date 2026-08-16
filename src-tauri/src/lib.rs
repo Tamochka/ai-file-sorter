@@ -6,6 +6,7 @@ use std::{
     future::Future,
     io::Read,
     net::IpAddr,
+    ops::Range,
     path::{Component, Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -146,6 +147,7 @@ struct AnalysisLogEvent {
     successful_files: usize,
     unresolved_files: usize,
     skipped_files: usize,
+    input_bytes: Option<usize>,
     error_kind: Option<String>,
     error_detail: Option<String>,
 }
@@ -176,6 +178,11 @@ const SORTED_DIR: &str = "AI Sorted";
 const UNPROCESSED_CATEGORY: &str = "Не обработано ИИ";
 const HISTORY_FILE: &str = ".ai-file-sorter-last-operation.json";
 const AI_BATCH_SIZE: usize = 10;
+// These limits are intentionally independent of the user-facing total limit.
+// A local model with a small context must never receive an unbounded prompt.
+const MAX_TEXT_CHARS_PER_FILE: usize = 3_000;
+const MAX_BATCH_CONTEXT_BYTES: usize = 8_000;
+const MAX_MODEL_RESPONSE_TOKENS: usize = 1_024;
 const AI_BATCH_TIMEOUT: Duration = Duration::from_secs(90);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -259,6 +266,7 @@ async fn analyze_folder(
             successful_files: contexts.len(),
             unresolved_files: 0,
             skipped_files: inaccessible_files,
+            input_bytes: None,
             error_kind: None,
             error_detail: None,
         },
@@ -305,6 +313,15 @@ fn prepare_analysis(
     let mut contexts = Vec::new();
     let mut warnings = Vec::new();
     let mut inaccessible_files = 0usize;
+    if sort.unlimited {
+        warnings.push(format!(
+            "Без общего лимита: все файлы будут проанализированы, но в ИИ передаётся не более {MAX_TEXT_CHARS_PER_FILE} символов текста на файл и {MAX_BATCH_CONTEXT_BYTES} байт контекста на запрос."
+        ));
+    } else if sort.text_limit > MAX_TEXT_CHARS_PER_FILE {
+        warnings.push(format!(
+            "Лимит текста на файл ограничен техническим максимумом {MAX_TEXT_CHARS_PER_FILE} символов, чтобы не превысить контекст модели."
+        ));
+    }
     for entry in WalkDir::new(&root).into_iter().filter_entry(scan_entry) {
         if cancelled.load(Ordering::Acquire) {
             return Err("Анализ отменён пользователем".into());
@@ -344,17 +361,12 @@ fn prepare_analysis(
             sort.total_limit.saturating_sub(total_chars)
         };
         let per_file_limit = if sort.unlimited {
-            usize::MAX
+            MAX_TEXT_CHARS_PER_FILE
         } else {
-            sort.text_limit
+            sort.text_limit.min(MAX_TEXT_CHARS_PER_FILE)
         };
         let (content_extract, content_status) =
             read_text_preview(path, &ext, per_file_limit.min(remaining));
-        total_chars = total_chars.saturating_add(
-            content_extract
-                .as_ref()
-                .map_or(0, |text| text.chars().count()),
-        );
         let (category, confidence, explanation) = classify(relative, &ext, sort);
         let date = metadata
             .modified()
@@ -368,7 +380,7 @@ fn prepare_analysis(
             .join(date)
             .join(relative);
         let id = Uuid::new_v4().to_string();
-        contexts.push(AiFileContext {
+        let mut context = AiFileContext {
             id: id.clone(),
             path: relative.to_string_lossy().into_owned(),
             extension: ext.clone(),
@@ -378,7 +390,15 @@ fn prepare_analysis(
             suggested_category: category.clone(),
             content_extract,
             content_status,
-        });
+        };
+        fit_context_into_model_budget(&mut context);
+        total_chars = total_chars.saturating_add(
+            context
+                .content_extract
+                .as_ref()
+                .map_or(0, |text| text.chars().count()),
+        );
+        contexts.push(context);
         items.push(PlanItem {
             id,
             source: path.to_string_lossy().into_owned(),
@@ -464,6 +484,67 @@ fn extension_summary(contexts: &[AiFileContext]) -> Vec<ExtensionCount> {
         });
     }
     summary
+}
+
+fn model_context_bytes(context: &AiFileContext) -> usize {
+    serde_json::to_vec(context)
+        .map(|serialized| serialized.len())
+        .unwrap_or(usize::MAX)
+}
+
+fn model_batch_context_bytes(batch: &[AiFileContext]) -> usize {
+    batch.iter().fold(0usize, |total, context| {
+        total.saturating_add(model_context_bytes(context))
+    })
+}
+
+fn shorten_text(value: &str, maximum_chars: usize) -> String {
+    value.chars().take(maximum_chars).collect()
+}
+
+fn fit_context_into_model_budget(context: &mut AiFileContext) {
+    let mut was_shortened = false;
+    while model_context_bytes(context) > MAX_BATCH_CONTEXT_BYTES {
+        let Some(text) = context.content_extract.as_ref() else {
+            break;
+        };
+        let length = text.chars().count();
+        if length == 0 {
+            break;
+        }
+        let reduced_length = length.saturating_mul(3).saturating_div(4).max(1);
+        context.content_extract = Some(shorten_text(text, reduced_length));
+        was_shortened = true;
+    }
+    if was_shortened {
+        context.content_status =
+            "Текст сокращён до безопасного размера ИИ-запроса; использованы также метаданные файла."
+                .into();
+    }
+}
+
+fn model_batch_ranges(contexts: &[AiFileContext]) -> Vec<Range<usize>> {
+    if contexts.is_empty() {
+        return Vec::new();
+    }
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut current_bytes = 0usize;
+    for (index, context) in contexts.iter().enumerate() {
+        let context_bytes = model_context_bytes(context);
+        let current_count = index.saturating_sub(start);
+        if current_count > 0
+            && (current_count >= AI_BATCH_SIZE
+                || current_bytes.saturating_add(context_bytes) > MAX_BATCH_CONTEXT_BYTES)
+        {
+            ranges.push(start..index);
+            start = index;
+            current_bytes = 0;
+        }
+        current_bytes = current_bytes.saturating_add(context_bytes);
+    }
+    ranges.push(start..contexts.len());
+    ranges
 }
 
 fn anonymized_error(error: &str) -> (String, String) {
@@ -595,7 +676,7 @@ async fn test_connection(ai: AiSettings) -> Result<String, String> {
     if ai.base_url.trim().is_empty() {
         return Err("Укажите базовый URL".into());
     }
-    let url = format!("{}/models", ai.base_url.trim_end_matches('/'));
+    let url = test_connection_url(&ai);
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(8))
@@ -613,6 +694,15 @@ async fn test_connection(ai: AiSettings) -> Result<String, String> {
         .error_for_status()
         .map_err(|error| anonymized_error(&format!("Сервис вернул ошибку HTTP: {error}")).1)?;
     Ok("Подключение успешно".into())
+}
+
+fn test_connection_url(ai: &AiSettings) -> String {
+    let base_url = ai.base_url.trim_end_matches('/');
+    if ai.provider == "ollama" {
+        format!("{}/api/tags", base_url.trim_end_matches("/v1"))
+    } else {
+        format!("{base_url}/models")
+    }
 }
 
 #[tauri::command]
@@ -1215,31 +1305,42 @@ async fn request_model_batch(
     if cancelled.load(Ordering::Acquire) {
         return Err(BatchError::Cancelled);
     }
+    let context_bytes = model_batch_context_bytes(&batch);
+    if context_bytes > MAX_BATCH_CONTEXT_BYTES {
+        return Err(BatchError::Failure(format!(
+            "Входной контекст пакета ({context_bytes} байт) превышает безопасный лимит {MAX_BATCH_CONTEXT_BYTES} байт."
+        )));
+    }
     let instruction = if sort.mode == "custom" {
         sort.custom_prompt.as_str()
     } else {
         "Используй только категории: Работа, Личное, Финансы, Учёба, Медиа, Архив, Загрузчики, Прочее. Установочные файлы с расширениями DMG, EXE, PKG, MSI и похожими всегда относятся к Загрузчикам."
     };
-    let url = format!("{}/chat/completions", ai.base_url.trim_end_matches('/'));
+    let url = chat_completions_url(ai);
     let prompt = format!("Классифицируй только этот небольшой пакет файлов. Инструкция: {instruction}\nДля каждого файла сначала используй contentExtract, если он есть. Если его нет, анализируй только метаданные: path, extension, sizeBytes, даты и suggestedCategory. Не выдумывай содержимое. Верни ТОЛЬКО JSON-массив объектов {{id, category, explanation, confidence}}. Верни ровно одно решение для каждого переданного id. category — короткое безопасное имя папки без / и \\.\nФайлы: {}", serde_json::to_string(&batch).map_err(|error| BatchError::Failure(error.to_string()))?);
-    let body = serde_json::json!({"model":ai.model,"temperature":0,"messages":[{"role":"system","content":"Ты отвечаешь строго валидным JSON без Markdown."},{"role":"user","content":prompt}]});
+    let body = serde_json::json!({"model":ai.model,"temperature":0,"max_tokens":MAX_MODEL_RESPONSE_TOKENS,"messages":[{"role":"system","content":"Ты отвечаешь строго валидным JSON без Markdown."},{"role":"user","content":prompt}]});
     let mut request = client.post(&url).json(&body);
     if !ai.api_key.trim().is_empty() {
         request = request.bearer_auth(&ai.api_key);
     }
-    let operation = async {
-        let response = request
-            .send()
-            .await
-            .map_err(|error| BatchError::Failure(format!("Ошибка запроса к модели: {error}")))?
-            .error_for_status()
-            .map_err(|error| BatchError::Failure(format!("Модель вернула ошибку HTTP: {error}")))?;
-        let value: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|error| BatchError::Failure(format!("Ответ API не является JSON: {error}")))?;
-        parse_model_response(&value).map_err(BatchError::Failure)
-    };
+    let operation =
+        async {
+            let response = request.send().await.map_err(|error| {
+                BatchError::Failure(format!("Ошибка запроса к модели: {error}"))
+            })?;
+            let status = response.status();
+            if !status.is_success() {
+                let response_body = response.text().await.unwrap_or_default();
+                return Err(BatchError::Failure(model_http_error(
+                    status,
+                    &response_body,
+                )));
+            }
+            let value: serde_json::Value = response.json().await.map_err(|error| {
+                BatchError::Failure(format!("Ответ API не является JSON: {error}"))
+            })?;
+            parse_model_response(&value).map_err(BatchError::Failure)
+        };
 
     tokio::select! {
         _ = wait_for_cancellation(cancelled) => Err(BatchError::Cancelled),
@@ -1250,6 +1351,48 @@ async fn request_model_batch(
             )))?
         }
     }
+}
+
+fn chat_completions_url(ai: &AiSettings) -> String {
+    let base_url = ai.base_url.trim_end_matches('/');
+    if ai.provider == "ollama" && !base_url.ends_with("/v1") {
+        format!("{base_url}/v1/chat/completions")
+    } else {
+        format!("{base_url}/chat/completions")
+    }
+}
+
+fn model_http_error(status: reqwest::StatusCode, response_body: &str) -> String {
+    let body = response_body.to_lowercase();
+    let reason = if ["context", "token", "max_tokens", "context_length"]
+        .iter()
+        .any(|marker| body.contains(marker))
+    {
+        "запрос превышает доступный контекст модели"
+    } else if [
+        "payload",
+        "request too large",
+        "body too large",
+        "too large",
+    ]
+    .iter()
+    .any(|marker| body.contains(marker))
+    {
+        "запрос слишком большой для API модели"
+    } else if ["model not found", "unknown model", "model is not loaded"]
+        .iter()
+        .any(|marker| body.contains(marker))
+    {
+        "выбранная модель не найдена или не загружена"
+    } else if ["api key", "unauthorized", "authentication", "forbidden"]
+        .iter()
+        .any(|marker| body.contains(marker))
+    {
+        "API отклонил авторизацию"
+    } else {
+        "API отклонил запрос; подробности ответа скрыты для конфиденциальности"
+    };
+    format!("Модель вернула HTTP {status}: {reason}.")
 }
 
 async fn wait_for_cancellation(cancelled: Arc<AtomicBool>) {
@@ -1302,6 +1445,7 @@ fn batch_log_event(
         successful_files,
         unresolved_files,
         skipped_files: 0,
+        input_bytes: Some(model_batch_context_bytes(batch)),
         error_kind,
         error_detail,
     }
@@ -1336,10 +1480,13 @@ where
     }
     let mut result = AiRefinement::default();
     let mut first_failures = HashMap::<String, String>::new();
-    let main_batches = contexts.len().div_ceil(AI_BATCH_SIZE);
+    let main_batch_ranges = model_batch_ranges(contexts);
+    let main_batches = main_batch_ranges.len();
+    let mut attempted_main_files = 0usize;
 
-    for (index, batch) in contexts.chunks(AI_BATCH_SIZE).enumerate() {
-        let not_attempted_before = contexts.len().saturating_sub(index * AI_BATCH_SIZE);
+    for (index, range) in main_batch_ranges.iter().enumerate() {
+        let batch = &contexts[range.clone()];
+        let not_attempted_before = contexts.len().saturating_sub(attempted_main_files);
         progress(AnalysisProgress {
             phase: "main".into(),
             completed_batches: index,
@@ -1419,9 +1566,8 @@ where
                 return Err("Анализ отменён пользователем".into());
             }
         }
-        let not_attempted_after = contexts
-            .len()
-            .saturating_sub(((index + 1) * AI_BATCH_SIZE).min(contexts.len()));
+        attempted_main_files = attempted_main_files.saturating_add(batch.len());
+        let not_attempted_after = contexts.len().saturating_sub(attempted_main_files);
         progress(AnalysisProgress {
             phase: "main".into(),
             completed_batches: index + 1,
@@ -1442,8 +1588,10 @@ where
         .filter(|context| item_status(items, &context.id) == Some(AiStatus::RetryPending))
         .cloned()
         .collect();
-    let retry_batches = retry_contexts.len().div_ceil(AI_BATCH_SIZE);
-    for (index, batch) in retry_contexts.chunks(AI_BATCH_SIZE).enumerate() {
+    let retry_batch_ranges = model_batch_ranges(&retry_contexts);
+    let retry_batches = retry_batch_ranges.len();
+    for (index, range) in retry_batch_ranges.iter().enumerate() {
+        let batch = &retry_contexts[range.clone()];
         progress(AnalysisProgress {
             phase: "retry".into(),
             completed_batches: index,
@@ -1924,6 +2072,58 @@ mod tests {
     }
 
     #[test]
+    fn context_error_is_useful_without_exposing_server_response() {
+        let error = model_http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"context length 12000 exceeds 4096 for /Users/private/secret.txt"}}"#,
+        );
+        assert!(error.contains("превышает доступный контекст"));
+        assert!(!error.contains("secret.txt"));
+        assert!(!error.contains("/Users/"));
+    }
+
+    #[test]
+    fn ollama_uses_its_openai_compatible_chat_endpoint() {
+        let ai = AiSettings {
+            provider: "ollama".into(),
+            base_url: "http://127.0.0.1:11434".into(),
+            model: "test".into(),
+            api_key: String::new(),
+            cloud_consent: false,
+        };
+        assert_eq!(
+            chat_completions_url(&ai),
+            "http://127.0.0.1:11434/v1/chat/completions"
+        );
+        assert_eq!(test_connection_url(&ai), "http://127.0.0.1:11434/api/tags");
+    }
+
+    #[test]
+    fn contexts_are_split_by_payload_size_and_file_count() {
+        let (_, mut contexts) = plan(5);
+        for context in &mut contexts {
+            context.content_extract = Some("a".repeat(3_800));
+            fit_context_into_model_budget(context);
+        }
+        let ranges = model_batch_ranges(&contexts);
+        assert!(ranges.len() > 1);
+        for range in ranges {
+            let batch = &contexts[range];
+            assert!(batch.len() <= AI_BATCH_SIZE);
+            assert!(model_batch_context_bytes(batch) <= MAX_BATCH_CONTEXT_BYTES);
+        }
+    }
+
+    #[test]
+    fn oversized_context_text_is_trimmed_before_request() {
+        let (_, mut contexts) = plan(1);
+        contexts[0].content_extract = Some("a".repeat(MAX_BATCH_CONTEXT_BYTES * 2));
+        fit_context_into_model_budget(&mut contexts[0]);
+        assert!(model_context_bytes(&contexts[0]) <= MAX_BATCH_CONTEXT_BYTES);
+        assert!(contexts[0].content_status.contains("сокращён"));
+    }
+
+    #[test]
     fn extension_summary_contains_no_file_names_or_paths() {
         let (_, mut contexts) = plan(3);
         contexts[0].extension = "PDF".into();
@@ -2344,6 +2544,41 @@ mod tests {
         assert_eq!(preview.as_deref(), Some("😀😀😀😀😀"));
         assert!(status.contains("фрагмент"));
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn unlimited_mode_keeps_each_text_extract_bounded() {
+        let root =
+            std::env::temp_dir().join(format!("ai-file-sorter-unlimited-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("large.txt"),
+            "a".repeat(MAX_TEXT_CHARS_PER_FILE * 4),
+        )
+        .unwrap();
+        let sort = SortSettings {
+            mode: "standard".into(),
+            custom_prompt: String::new(),
+            text_limit: usize::MAX,
+            total_limit: usize::MAX,
+            unlimited: true,
+        };
+        let prepared = prepare_analysis(
+            root.to_string_lossy().into_owned(),
+            &sort,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(prepared.contexts.len(), 1);
+        assert!(prepared.contexts[0]
+            .content_extract
+            .as_ref()
+            .is_some_and(|text| text.chars().count() <= MAX_TEXT_CHARS_PER_FILE));
+        assert!(prepared
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Без общего лимита")));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
