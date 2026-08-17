@@ -74,7 +74,7 @@ jobs:
       - name: Upload Windows application
         uses: actions/upload-artifact@v7
         with:
-          name: AI-File-Sorter-v0.2.3-Windows-x64
+          name: AI-File-Sorter-v0.2.4-Windows-x64
           path: |
             src-tauri/target/release/bundle/nsis/*-setup.exe
             src-tauri/target/release/bundle/nsis/SHA256SUMS.txt

@@ -1,5 +1,5 @@
 use chrono::{DateTime, Local};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs::{self, OpenOptions},
@@ -91,7 +91,43 @@ struct AiDecision {
     id: String,
     category: String,
     explanation: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_confidence")]
     confidence: Option<f32>,
+}
+
+fn deserialize_confidence<'de, D>(deserializer: D) -> Result<Option<f32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let confidence = match value {
+        serde_json::Value::Number(number) => number.as_f64().map(|number| number as f32),
+        serde_json::Value::String(value) => {
+            let normalized = value.trim().to_lowercase();
+            match normalized.as_str() {
+                "high" | "высокая" | "высокий" | "высоко" => Some(0.75),
+                "medium" | "average" | "средняя" | "средний" | "средне" => {
+                    Some(0.5)
+                }
+                "low" | "низкая" | "низкий" | "низко" => Some(0.25),
+                _ => {
+                    let is_percent = normalized.ends_with('%');
+                    normalized
+                        .trim_end_matches('%')
+                        .trim()
+                        .replace(',', ".")
+                        .parse::<f32>()
+                        .ok()
+                        .map(|number| if is_percent { number / 100.0 } else { number })
+                }
+            }
+        }
+        _ => None,
+    };
+    Ok(confidence)
 }
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -177,14 +213,25 @@ struct PreparedAnalysis {
 const SORTED_DIR: &str = "AI Sorted";
 const UNPROCESSED_CATEGORY: &str = "Не обработано ИИ";
 const HISTORY_FILE: &str = ".ai-file-sorter-last-operation.json";
-const AI_BATCH_SIZE: usize = 10;
+const AI_BATCH_SIZE: usize = 5;
 // These limits are intentionally independent of the user-facing total limit.
 // A local model with a small context must never receive an unbounded prompt.
-const MAX_TEXT_CHARS_PER_FILE: usize = 3_000;
-const MAX_BATCH_CONTEXT_BYTES: usize = 8_000;
-const MAX_MODEL_RESPONSE_TOKENS: usize = 1_024;
+const MAX_TEXT_CHARS_PER_FILE: usize = 600;
+const MAX_BATCH_CONTEXT_BYTES: usize = 4_000;
+const MAX_MODEL_RESPONSE_TOKENS: usize = 512;
+const MAX_CUSTOM_PROMPT_CHARS: usize = 600;
 const AI_BATCH_TIMEOUT: Duration = Duration::from_secs(90);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const STANDARD_CATEGORIES: [&str; 8] = [
+    "Работа",
+    "Личное",
+    "Финансы",
+    "Учёба",
+    "Медиа",
+    "Архив",
+    "Загрузчики",
+    "Прочее",
+];
 
 #[tauri::command]
 async fn analyze_folder(
@@ -322,6 +369,11 @@ fn prepare_analysis(
             "Лимит текста на файл ограничен техническим максимумом {MAX_TEXT_CHARS_PER_FILE} символов, чтобы не превысить контекст модели."
         ));
     }
+    if sort.mode == "custom" && sort.custom_prompt.chars().count() > MAX_CUSTOM_PROMPT_CHARS {
+        warnings.push(format!(
+            "Для устойчивости в ИИ передаются только первые {MAX_CUSTOM_PROMPT_CHARS} символов пользовательской инструкции."
+        ));
+    }
     for entry in WalkDir::new(&root).into_iter().filter_entry(scan_entry) {
         if cancelled.load(Ordering::Acquire) {
             return Err("Анализ отменён пользователем".into());
@@ -368,17 +420,12 @@ fn prepare_analysis(
         let (content_extract, content_status) =
             read_text_preview(path, &ext, per_file_limit.min(remaining));
         let (category, confidence, explanation) = classify(relative, &ext, sort);
-        let date = metadata
+        let year = metadata
             .modified()
             .ok()
-            .map(|t| DateTime::<Local>::from(t).format("%Y/%m").to_string())
+            .map(|t| DateTime::<Local>::from(t).format("%Y").to_string())
             .unwrap_or_else(|| "Без даты".into());
-        let kind = file_kind(&ext);
-        let target = Path::new(SORTED_DIR)
-            .join(safe_name(&category))
-            .join(kind)
-            .join(date)
-            .join(relative);
+        let target = planned_target(&category, &year, relative);
         let id = Uuid::new_v4().to_string();
         let mut context = AiFileContext {
             id: id.clone(),
@@ -1092,21 +1139,73 @@ fn safe_name(value: &str) -> String {
         clean
     }
 }
-fn file_kind(ext: &str) -> &'static str {
-    match ext {
-        "dmg" | "pkg" | "mpkg" | "exe" | "msi" | "appimage" | "deb" | "rpm" | "apk" | "iso" => {
-            "Установщики"
-        }
-        "pdf" => "PDF",
-        "doc" | "docx" | "odt" => "Документы",
-        "xls" | "xlsx" | "csv" => "Таблицы",
-        "txt" | "md" | "rtf" => "Текст",
-        "jpg" | "jpeg" | "png" | "webp" | "heic" => "Изображения",
-        "mp3" | "wav" | "m4a" => "Аудио",
-        "mp4" | "mov" | "mkv" => "Видео",
-        _ => "Прочие файлы",
-    }
+fn planned_target(category: &str, year: &str, relative: &Path) -> PathBuf {
+    let filename = relative
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(safe_name)
+        .unwrap_or_else(|| "файл".into());
+    Path::new(SORTED_DIR)
+        .join(safe_name(category))
+        .join(safe_name(year))
+        .join(filename)
 }
+
+fn restricted_category(value: &str, fallback: &str) -> String {
+    let normalized = value.trim().to_lowercase();
+    let category = if normalized.contains("работ")
+        || normalized.contains("work")
+        || normalized.contains("business")
+    {
+        Some("Работа")
+    } else if normalized.contains("личн")
+        || normalized.contains("personal")
+        || normalized.contains("private")
+    {
+        Some("Личное")
+    } else if normalized.contains("финанс")
+        || normalized.contains("finance")
+        || normalized.contains("bank")
+    {
+        Some("Финансы")
+    } else if normalized.contains("учеб")
+        || normalized.contains("study")
+        || normalized.contains("education")
+    {
+        Some("Учёба")
+    } else if normalized.contains("медиа")
+        || normalized.contains("media")
+        || normalized.contains("photo")
+        || normalized.contains("video")
+    {
+        Some("Медиа")
+    } else if normalized.contains("архив") || normalized.contains("archive") {
+        Some("Архив")
+    } else if normalized.contains("загруз")
+        || normalized.contains("download")
+        || normalized.contains("install")
+    {
+        Some("Загрузчики")
+    } else if normalized.contains("проч")
+        || normalized.contains("other")
+        || normalized.contains("misc")
+    {
+        Some("Прочее")
+    } else {
+        None
+    };
+    let safe_fallback = STANDARD_CATEGORIES
+        .iter()
+        .copied()
+        .find(|category| *category == fallback)
+        .unwrap_or("Прочее");
+    category.unwrap_or(safe_fallback).to_string()
+}
+
+fn bounded_custom_prompt(value: &str) -> String {
+    value.chars().take(MAX_CUSTOM_PROMPT_CHARS).collect()
+}
+
 fn unsupported_warning(ext: &str) -> Option<String> {
     if matches!(ext, "mp3" | "wav" | "m4a" | "mp4" | "mov" | "mkv") {
         Some("Содержимое аудио/видео в первой версии не анализируется.".into())
@@ -1184,7 +1283,7 @@ fn read_text_preview(path: &Path, ext: &str, limit: usize) -> (Option<String>, S
         ),
     }
 }
-fn classify(relative: &Path, ext: &str, sort: &SortSettings) -> (String, f32, String) {
+fn classify(relative: &Path, ext: &str, _sort: &SortSettings) -> (String, f32, String) {
     let name = relative.to_string_lossy().to_lowercase();
     let installer = matches!(
         ext,
@@ -1200,9 +1299,7 @@ fn classify(relative: &Path, ext: &str, sort: &SortSettings) -> (String, f32, St
         ]
         .iter()
         .any(|word| name.contains(word)));
-    let category = if sort.mode == "custom" && !sort.custom_prompt.trim().is_empty() {
-        "Кастомная категория"
-    } else if installer {
+    let category = if installer {
         "Загрузчики"
     } else if name.contains("invoice")
         || name.contains("счёт")
@@ -1311,13 +1408,17 @@ async fn request_model_batch(
             "Входной контекст пакета ({context_bytes} байт) превышает безопасный лимит {MAX_BATCH_CONTEXT_BYTES} байт."
         )));
     }
-    let instruction = if sort.mode == "custom" {
-        sort.custom_prompt.as_str()
+    let category_rule = "Категория должна быть ровно одной из: Работа, Личное, Финансы, Учёба, Медиа, Архив, Загрузчики, Прочее.";
+    let instruction = if sort.mode == "custom" && !sort.custom_prompt.trim().is_empty() {
+        format!(
+            "{category_rule} Дополнительная инструкция пользователя: {}",
+            bounded_custom_prompt(&sort.custom_prompt)
+        )
     } else {
-        "Используй только категории: Работа, Личное, Финансы, Учёба, Медиа, Архив, Загрузчики, Прочее. Установочные файлы с расширениями DMG, EXE, PKG, MSI и похожими всегда относятся к Загрузчикам."
+        format!("{category_rule} Установочные файлы с расширениями DMG, EXE, PKG, MSI и похожими всегда относятся к Загрузчикам.")
     };
     let url = chat_completions_url(ai);
-    let prompt = format!("Классифицируй только этот небольшой пакет файлов. Инструкция: {instruction}\nДля каждого файла сначала используй contentExtract, если он есть. Если его нет, анализируй только метаданные: path, extension, sizeBytes, даты и suggestedCategory. Не выдумывай содержимое. Верни ТОЛЬКО JSON-массив объектов {{id, category, explanation, confidence}}. Верни ровно одно решение для каждого переданного id. category — короткое безопасное имя папки без / и \\.\nФайлы: {}", serde_json::to_string(&batch).map_err(|error| BatchError::Failure(error.to_string()))?);
+    let prompt = format!("Классифицируй только этот небольшой пакет файлов. Инструкция: {instruction}\nДля каждого файла сначала используй contentExtract, если он есть. Если его нет, анализируй только метаданные: path, extension, sizeBytes, даты и suggestedCategory. Не выдумывай содержимое. Верни ТОЛЬКО JSON-массив объектов {{id, category, explanation, confidence}}. Верни ровно одно решение для каждого переданного id.\nФайлы: {}", serde_json::to_string(&batch).map_err(|error| BatchError::Failure(error.to_string()))?);
     let body = serde_json::json!({"model":ai.model,"temperature":0,"max_tokens":MAX_MODEL_RESPONSE_TOKENS,"messages":[{"role":"system","content":"Ты отвечаешь строго валидным JSON без Markdown."},{"role":"user","content":prompt}]});
     let mut request = client.post(&url).json(&body);
     if !ai.api_key.trim().is_empty() {
@@ -1776,7 +1877,7 @@ fn apply_ai_decision(sort: &SortSettings, items: &mut [PlanItem], decision: AiDe
         return;
     };
     if !(sort.mode == "standard" && item.category == "Загрузчики") {
-        let category = safe_name(decision.category.trim());
+        let category = restricted_category(&decision.category, &item.category);
         item.category = category.clone();
         retarget_item(item, &category);
     }
@@ -1862,7 +1963,7 @@ mod tests {
                 id: id.clone(),
                 source: format!("/tmp/root/{relative}"),
                 relative_path: relative.clone(),
-                target: format!("{SORTED_DIR}/Личное/Текст/2026/08/{relative}"),
+                target: format!("{SORTED_DIR}/Личное/2026/file-{index}.txt"),
                 category: "Личное".into(),
                 explanation: "Локальная оценка".into(),
                 confidence: 0.45,
@@ -1915,7 +2016,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(calls, 3);
+        assert_eq!(calls, 5);
         assert_eq!(
             result.summary,
             AiSummary {
@@ -1951,22 +2052,22 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(calls, 4);
+        assert_eq!(calls, 6);
         assert_eq!(
             result.summary,
             AiSummary {
                 ai_processed: 23,
-                retry_succeeded: 10,
+                retry_succeeded: 5,
                 ai_unprocessed: 0
             }
         );
         assert_eq!(items[20].explanation, "Решение модели");
-        assert_eq!(items[10].ai_status, AiStatus::Processed);
+        assert_eq!(items[5].ai_status, AiStatus::Processed);
     }
 
     #[tokio::test]
     async fn second_failure_moves_only_failed_files_to_unprocessed() {
-        let (mut items, contexts) = plan(15);
+        let (mut items, contexts) = plan(10);
         let mut calls = 0;
         let result = refine_in_batches(
             &test_sort(),
@@ -1989,20 +2090,20 @@ mod tests {
         assert_eq!(
             result.summary,
             AiSummary {
-                ai_processed: 10,
+                ai_processed: 5,
                 retry_succeeded: 0,
                 ai_unprocessed: 5
             }
         );
-        assert!(items[..10]
+        assert!(items[..5]
             .iter()
             .all(|item| item.ai_status == AiStatus::Processed));
-        for item in &items[10..] {
+        for item in &items[5..] {
             assert_eq!(item.ai_status, AiStatus::Unprocessed);
             assert_eq!(item.category, UNPROCESSED_CATEGORY);
             let expected_parent = PathBuf::from(SORTED_DIR)
                 .join(UNPROCESSED_CATEGORY)
-                .join("Текст/2026/08/исходная/папка");
+                .join("2026");
             assert!(Path::new(&item.target).starts_with(expected_parent));
             assert!(item.included);
             let error = item.ai_error.as_deref().unwrap();
@@ -2022,7 +2123,7 @@ mod tests {
             |batch| {
                 calls += 1;
                 let response = if calls == 1 {
-                    Ok(decisions(&batch[..8]))
+                    Ok(decisions(&batch[..3]))
                 } else {
                     Ok(decisions(&batch))
                 };
@@ -2033,7 +2134,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(calls, 3);
+        assert_eq!(calls, 4);
         assert_eq!(
             result.summary,
             AiSummary {
@@ -2055,6 +2156,16 @@ mod tests {
         assert!(parse_model_response(&value)
             .unwrap_err()
             .contains("невалидный JSON"));
+    }
+
+    #[test]
+    fn string_confidence_does_not_discard_a_valid_model_decision() {
+        let value = serde_json::json!({
+            "choices": [{"message": {"content": r#"[{"id":"file-1","category":"Работа","confidence":"high"}]"#}}]
+        });
+        let decisions = parse_model_response(&value).unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].confidence, Some(0.75));
     }
 
     #[test]
@@ -2166,12 +2277,12 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(log_events.len(), 2);
+        assert_eq!(log_events.len(), 3);
         assert_eq!(log_events[0].attempt, Some(1));
         assert_eq!(log_events[0].batch_number, Some(1));
-        assert_eq!(log_events[0].file_count, 10);
+        assert_eq!(log_events[0].file_count, 5);
         assert_eq!(log_events[0].outcome, "success");
-        assert_eq!(log_events[0].successful_files, 10);
+        assert_eq!(log_events[0].successful_files, 5);
         assert!(log_events[0].extensions.contains(&ExtensionCount {
             extension: ".pdf".into(),
             count: 2,
@@ -2181,10 +2292,10 @@ mod tests {
             .iter()
             .find(|progress| progress.phase == "main" && progress.completed_batches == 1)
             .unwrap();
-        assert_eq!(after_first_batch.processed_files, 10);
-        assert_eq!(after_first_batch.not_attempted_files, 2);
+        assert_eq!(after_first_batch.processed_files, 5);
+        assert_eq!(after_first_batch.not_attempted_files, 7);
         assert_eq!(after_first_batch.retry_pending_files, 0);
-        assert_eq!(after_first_batch.pending_files, 2);
+        assert_eq!(after_first_batch.pending_files, 7);
     }
 
     #[tokio::test]
@@ -2533,6 +2644,31 @@ mod tests {
         assert_eq!(
             classify(Path::new("tax_invoice.pdf"), "pdf", &test_sort()).0,
             "Финансы"
+        );
+    }
+
+    #[test]
+    fn model_categories_cannot_create_new_top_level_folders() {
+        assert_eq!(restricted_category("Business", "Личное"), "Работа");
+        assert_eq!(restricted_category("Adello Visuals", "Личное"), "Личное");
+        assert_eq!(
+            restricted_category("unknown", "Кастомная категория"),
+            "Прочее"
+        );
+    }
+
+    #[test]
+    fn custom_instruction_has_a_hard_character_limit() {
+        let prompt = "я".repeat(MAX_CUSTOM_PROMPT_CHARS + 1);
+        let bounded = bounded_custom_prompt(&prompt);
+        assert_eq!(bounded.chars().count(), MAX_CUSTOM_PROMPT_CHARS);
+    }
+
+    #[test]
+    fn planned_target_uses_only_category_year_and_filename() {
+        assert_eq!(
+            planned_target("Работа", "2026", Path::new("old/nested/report:final.pdf")),
+            PathBuf::from("AI Sorted/Работа/2026/report_final.pdf")
         );
     }
 
