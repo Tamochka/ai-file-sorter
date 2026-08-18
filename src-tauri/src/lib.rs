@@ -213,14 +213,13 @@ struct PreparedAnalysis {
 const SORTED_DIR: &str = "AI Sorted";
 const UNPROCESSED_CATEGORY: &str = "Не обработано ИИ";
 const HISTORY_FILE: &str = ".ai-file-sorter-last-operation.json";
-const AI_BATCH_SIZE: usize = 5;
-// These limits are intentionally independent of the user-facing total limit.
-// A local model with a small context must never receive an unbounded prompt.
-const MAX_TEXT_CHARS_PER_FILE: usize = 600;
-const MAX_BATCH_CONTEXT_BYTES: usize = 4_000;
+const AI_BATCH_SIZE: usize = 10;
+// This cap applies to the whole request, after the user-selected per-file text limit.
+// It keeps local models from receiving an unbounded prompt.
+const MAX_BATCH_CONTEXT_BYTES: usize = 8_000;
 const MAX_MODEL_RESPONSE_TOKENS: usize = 512;
 const MAX_CUSTOM_PROMPT_CHARS: usize = 600;
-const AI_BATCH_TIMEOUT: Duration = Duration::from_secs(90);
+const AI_BATCH_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const STANDARD_CATEGORIES: [&str; 8] = [
     "Работа",
@@ -362,11 +361,7 @@ fn prepare_analysis(
     let mut inaccessible_files = 0usize;
     if sort.unlimited {
         warnings.push(format!(
-            "Без общего лимита: все файлы будут проанализированы, но в ИИ передаётся не более {MAX_TEXT_CHARS_PER_FILE} символов текста на файл и {MAX_BATCH_CONTEXT_BYTES} байт контекста на запрос."
-        ));
-    } else if sort.text_limit > MAX_TEXT_CHARS_PER_FILE {
-        warnings.push(format!(
-            "Лимит текста на файл ограничен техническим максимумом {MAX_TEXT_CHARS_PER_FILE} символов, чтобы не превысить контекст модели."
+            "Без общего лимита: для каждого файла используется заданный лимит текста, а один запрос к ИИ ограничен {MAX_BATCH_CONTEXT_BYTES} байтами контекста."
         ));
     }
     if sort.mode == "custom" && sort.custom_prompt.chars().count() > MAX_CUSTOM_PROMPT_CHARS {
@@ -412,11 +407,7 @@ fn prepare_analysis(
         } else {
             sort.total_limit.saturating_sub(total_chars)
         };
-        let per_file_limit = if sort.unlimited {
-            MAX_TEXT_CHARS_PER_FILE
-        } else {
-            sort.text_limit.min(MAX_TEXT_CHARS_PER_FILE)
-        };
+        let per_file_limit = sort.text_limit;
         let (content_extract, content_status) =
             read_text_preview(path, &ext, per_file_limit.min(remaining));
         let (category, confidence, explanation) = classify(relative, &ext, sort);
@@ -2007,7 +1998,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(calls, 5);
+        assert_eq!(calls, 3);
         assert_eq!(
             result.summary,
             AiSummary {
@@ -2043,12 +2034,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(calls, 6);
+        assert_eq!(calls, 4);
         assert_eq!(
             result.summary,
             AiSummary {
                 ai_processed: 23,
-                retry_succeeded: 5,
+                retry_succeeded: 10,
                 ai_unprocessed: 0
             }
         );
@@ -2058,7 +2049,7 @@ mod tests {
 
     #[tokio::test]
     async fn second_failure_moves_only_failed_files_to_unprocessed() {
-        let (mut items, contexts) = plan(10);
+        let (mut items, contexts) = plan(20);
         let mut calls = 0;
         let result = refine_in_batches(
             &test_sort(),
@@ -2081,15 +2072,15 @@ mod tests {
         assert_eq!(
             result.summary,
             AiSummary {
-                ai_processed: 5,
+                ai_processed: 10,
                 retry_succeeded: 0,
-                ai_unprocessed: 5
+                ai_unprocessed: 10
             }
         );
-        assert!(items[..5]
+        assert!(items[..10]
             .iter()
             .all(|item| item.ai_status == AiStatus::Processed));
-        for item in &items[5..] {
+        for item in &items[10..] {
             assert_eq!(item.ai_status, AiStatus::Unprocessed);
             assert_eq!(item.category, UNPROCESSED_CATEGORY);
             let expected_parent = PathBuf::from(SORTED_DIR).join(UNPROCESSED_CATEGORY);
@@ -2123,12 +2114,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(calls, 4);
+        assert_eq!(calls, 3);
         assert_eq!(
             result.summary,
             AiSummary {
                 ai_processed: 12,
-                retry_succeeded: 2,
+                retry_succeeded: 7,
                 ai_unprocessed: 0
             }
         );
@@ -2266,12 +2257,12 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(log_events.len(), 3);
+        assert_eq!(log_events.len(), 2);
         assert_eq!(log_events[0].attempt, Some(1));
         assert_eq!(log_events[0].batch_number, Some(1));
-        assert_eq!(log_events[0].file_count, 5);
+        assert_eq!(log_events[0].file_count, 10);
         assert_eq!(log_events[0].outcome, "success");
-        assert_eq!(log_events[0].successful_files, 5);
+        assert_eq!(log_events[0].successful_files, 10);
         assert!(log_events[0].extensions.contains(&ExtensionCount {
             extension: ".pdf".into(),
             count: 2,
@@ -2281,10 +2272,10 @@ mod tests {
             .iter()
             .find(|progress| progress.phase == "main" && progress.completed_batches == 1)
             .unwrap();
-        assert_eq!(after_first_batch.processed_files, 5);
-        assert_eq!(after_first_batch.not_attempted_files, 7);
+        assert_eq!(after_first_batch.processed_files, 10);
+        assert_eq!(after_first_batch.not_attempted_files, 2);
         assert_eq!(after_first_batch.retry_pending_files, 0);
-        assert_eq!(after_first_batch.pending_files, 7);
+        assert_eq!(after_first_batch.pending_files, 2);
     }
 
     #[tokio::test]
@@ -2672,19 +2663,15 @@ mod tests {
     }
 
     #[test]
-    fn unlimited_mode_keeps_each_text_extract_bounded() {
+    fn unlimited_mode_uses_the_custom_per_file_text_limit() {
         let root =
             std::env::temp_dir().join(format!("ai-file-sorter-unlimited-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
-        fs::write(
-            root.join("large.txt"),
-            "a".repeat(MAX_TEXT_CHARS_PER_FILE * 4),
-        )
-        .unwrap();
+        fs::write(root.join("large.txt"), "a".repeat(5_000)).unwrap();
         let sort = SortSettings {
             mode: "standard".into(),
             custom_prompt: String::new(),
-            text_limit: usize::MAX,
+            text_limit: 1_200,
             total_limit: usize::MAX,
             unlimited: true,
         };
@@ -2698,7 +2685,7 @@ mod tests {
         assert!(prepared.contexts[0]
             .content_extract
             .as_ref()
-            .is_some_and(|text| text.chars().count() <= MAX_TEXT_CHARS_PER_FILE));
+            .is_some_and(|text| text.chars().count() == 1_200));
         assert!(prepared
             .warnings
             .iter()
