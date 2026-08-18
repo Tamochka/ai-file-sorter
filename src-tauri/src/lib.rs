@@ -420,12 +420,7 @@ fn prepare_analysis(
         let (content_extract, content_status) =
             read_text_preview(path, &ext, per_file_limit.min(remaining));
         let (category, confidence, explanation) = classify(relative, &ext, sort);
-        let year = metadata
-            .modified()
-            .ok()
-            .map(|t| DateTime::<Local>::from(t).format("%Y").to_string())
-            .unwrap_or_else(|| "Без даты".into());
-        let target = planned_target(&category, &year, relative);
+        let target = planned_target(&category, relative);
         let id = Uuid::new_v4().to_string();
         let mut context = AiFileContext {
             id: id.clone(),
@@ -1139,7 +1134,7 @@ fn safe_name(value: &str) -> String {
         clean
     }
 }
-fn planned_target(category: &str, year: &str, relative: &Path) -> PathBuf {
+fn planned_target(category: &str, relative: &Path) -> PathBuf {
     let filename = relative
         .file_name()
         .and_then(|name| name.to_str())
@@ -1147,7 +1142,6 @@ fn planned_target(category: &str, year: &str, relative: &Path) -> PathBuf {
         .unwrap_or_else(|| "файл".into());
     Path::new(SORTED_DIR)
         .join(safe_name(category))
-        .join(safe_name(year))
         .join(filename)
 }
 
@@ -1418,8 +1412,8 @@ async fn request_model_batch(
         format!("{category_rule} Установочные файлы с расширениями DMG, EXE, PKG, MSI и похожими всегда относятся к Загрузчикам.")
     };
     let url = chat_completions_url(ai);
-    let prompt = format!("Классифицируй только этот небольшой пакет файлов. Инструкция: {instruction}\nДля каждого файла сначала используй contentExtract, если он есть. Если его нет, анализируй только метаданные: path, extension, sizeBytes, даты и suggestedCategory. Не выдумывай содержимое. Верни ТОЛЬКО JSON-массив объектов {{id, category, explanation, confidence}}. Верни ровно одно решение для каждого переданного id.\nФайлы: {}", serde_json::to_string(&batch).map_err(|error| BatchError::Failure(error.to_string()))?);
-    let body = serde_json::json!({"model":ai.model,"temperature":0,"max_tokens":MAX_MODEL_RESPONSE_TOKENS,"messages":[{"role":"system","content":"Ты отвечаешь строго валидным JSON без Markdown."},{"role":"user","content":prompt}]});
+    let prompt = format!("Классифицируй только этот небольшой пакет файлов. Инструкция: {instruction}\nДля каждого файла сначала используй contentExtract, если он есть. Если его нет, анализируй только метаданные: path, extension, sizeBytes, даты и suggestedCategory. Не выдумывай содержимое. Верни ТОЛЬКО компактный JSON-массив объектов {{id, category, confidence}}. Без explanation, Markdown и любого текста вне JSON. Верни ровно одно решение для каждого переданного id.\nФайлы: {}", serde_json::to_string(&batch).map_err(|error| BatchError::Failure(error.to_string()))?);
+    let body = serde_json::json!({"model":ai.model,"temperature":0,"max_tokens":MAX_MODEL_RESPONSE_TOKENS,"messages":[{"role":"system","content":"Отвечай только компактным валидным JSON-массивом. Каждый объект: id, category, confidence. Никакого Markdown, explanation или текста вне JSON."},{"role":"user","content":prompt}]});
     let mut request = client.post(&url).json(&body);
     if !ai.api_key.trim().is_empty() {
         request = request.bearer_auth(&ai.api_key);
@@ -1915,12 +1909,9 @@ fn mark_unprocessed(
 }
 
 fn retarget_item(item: &mut PlanItem, category: &str) {
-    let previous = Path::new(&item.target);
-    let mut revised = PathBuf::from(SORTED_DIR).join(category);
-    for component in previous.components().skip(2) {
-        revised.push(component.as_os_str());
-    }
-    item.target = revised.to_string_lossy().into_owned();
+    item.target = planned_target(category, Path::new(&item.relative_path))
+        .to_string_lossy()
+        .into_owned();
 }
 
 pub fn run() {
@@ -1963,7 +1954,7 @@ mod tests {
                 id: id.clone(),
                 source: format!("/tmp/root/{relative}"),
                 relative_path: relative.clone(),
-                target: format!("{SORTED_DIR}/Личное/2026/file-{index}.txt"),
+                target: format!("{SORTED_DIR}/Личное/file-{index}.txt"),
                 category: "Личное".into(),
                 explanation: "Локальная оценка".into(),
                 confidence: 0.45,
@@ -2101,9 +2092,7 @@ mod tests {
         for item in &items[5..] {
             assert_eq!(item.ai_status, AiStatus::Unprocessed);
             assert_eq!(item.category, UNPROCESSED_CATEGORY);
-            let expected_parent = PathBuf::from(SORTED_DIR)
-                .join(UNPROCESSED_CATEGORY)
-                .join("2026");
+            let expected_parent = PathBuf::from(SORTED_DIR).join(UNPROCESSED_CATEGORY);
             assert!(Path::new(&item.target).starts_with(expected_parent));
             assert!(item.included);
             let error = item.ai_error.as_deref().unwrap();
@@ -2665,10 +2654,10 @@ mod tests {
     }
 
     #[test]
-    fn planned_target_uses_only_category_year_and_filename() {
+    fn planned_target_uses_only_category_and_filename() {
         assert_eq!(
-            planned_target("Работа", "2026", Path::new("old/nested/report:final.pdf")),
-            PathBuf::from("AI Sorted/Работа/2026/report_final.pdf")
+            planned_target("Работа", Path::new("old/nested/report:final.pdf")),
+            PathBuf::from("AI Sorted/Работа/report_final.pdf")
         );
     }
 
