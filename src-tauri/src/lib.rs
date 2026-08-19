@@ -217,7 +217,6 @@ const AI_BATCH_SIZE: usize = 10;
 // This cap applies to the whole request, after the user-selected per-file text limit.
 // It keeps local models from receiving an unbounded prompt.
 const MAX_BATCH_CONTEXT_BYTES: usize = 8_000;
-const MAX_MODEL_RESPONSE_TOKENS: usize = 512;
 const MAX_CUSTOM_PROMPT_CHARS: usize = 600;
 const AI_BATCH_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -583,6 +582,13 @@ fn model_batch_ranges(contexts: &[AiFileContext]) -> Vec<Range<usize>> {
 fn anonymized_error(error: &str) -> (String, String) {
     let (kind, fallback) = if error.contains("Тайм-аут") || error.contains("timed out") {
         ("timeout", "Модель не ответила в установленное время")
+    } else if error.contains("finish_reason=length") {
+        (
+            "truncated_output",
+            "Модель не закончила формирование ответа",
+        )
+    } else if error.contains("Ответ модели пустой") {
+        ("empty_content", "Модель вернула пустой результат")
     } else if error.contains("невалидный JSON") || error.contains("не является JSON")
     {
         ("invalid_json", "Ответ модели не является валидным JSON")
@@ -1404,7 +1410,7 @@ async fn request_model_batch(
     };
     let url = chat_completions_url(ai);
     let prompt = format!("Классифицируй только этот небольшой пакет файлов. Инструкция: {instruction}\nДля каждого файла сначала используй contentExtract, если он есть. Если его нет, анализируй только метаданные: path, extension, sizeBytes, даты и suggestedCategory. Не выдумывай содержимое. Верни ТОЛЬКО компактный JSON-массив объектов {{id, category, confidence}}. Без explanation, Markdown и любого текста вне JSON. Верни ровно одно решение для каждого переданного id.\nФайлы: {}", serde_json::to_string(&batch).map_err(|error| BatchError::Failure(error.to_string()))?);
-    let body = serde_json::json!({"model":ai.model,"temperature":0,"max_tokens":MAX_MODEL_RESPONSE_TOKENS,"messages":[{"role":"system","content":"Отвечай только компактным валидным JSON-массивом. Каждый объект: id, category, confidence. Никакого Markdown, explanation или текста вне JSON."},{"role":"user","content":prompt}]});
+    let body = serde_json::json!({"model":ai.model,"temperature":0,"messages":[{"role":"system","content":"Отвечай только компактным валидным JSON-массивом. Каждый объект: id, category, confidence. Никакого Markdown, explanation или текста вне JSON."},{"role":"user","content":prompt}]});
     let mut request = client.post(&url).json(&body);
     if !ai.api_key.trim().is_empty() {
         request = request.bearer_auth(&ai.api_key);
@@ -1491,8 +1497,19 @@ fn parse_model_response(value: &serde_json::Value) -> Result<Vec<AiDecision>, St
     let content = value
         .pointer("/choices/0/message/content")
         .and_then(|v| v.as_str())
-        .ok_or("Ответ API не содержит choices[0].message.content")?;
+        .ok_or_else(|| {
+            format!(
+                "Ответ API не содержит choices[0].message.content; {}",
+                response_diagnostics(value)
+            )
+        })?;
     let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Err(format!(
+            "Ответ модели пустой; {}",
+            response_diagnostics(value)
+        ));
+    }
     let without_opening = trimmed
         .strip_prefix("```json")
         .or_else(|| trimmed.strip_prefix("```"))
@@ -1502,7 +1519,62 @@ fn parse_model_response(value: &serde_json::Value) -> Result<Vec<AiDecision>, St
         .strip_suffix("```")
         .unwrap_or(without_opening.trim())
         .trim();
-    serde_json::from_str(json).map_err(|error| format!("Модель вернула невалидный JSON: {error}"))
+    serde_json::from_str(json).map_err(|error| {
+        format!(
+            "Модель вернула невалидный JSON: {error}; {}",
+            response_diagnostics(value)
+        )
+    })
+}
+
+fn response_text_state(value: &serde_json::Value, pointer: &str) -> String {
+    match value.pointer(pointer) {
+        Some(serde_json::Value::String(text)) if text.trim().is_empty() => "пусто".into(),
+        Some(serde_json::Value::String(text)) => format!("{} симв.", text.chars().count()),
+        Some(_) => "не строка".into(),
+        None => "нет поля".into(),
+    }
+}
+
+fn safe_response_label(value: Option<&str>) -> String {
+    let label: String = value
+        .unwrap_or("нет поля")
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+        })
+        .take(40)
+        .collect();
+    if label.is_empty() {
+        "скрыто".into()
+    } else {
+        label
+    }
+}
+
+fn response_number(value: &serde_json::Value, pointer: &str) -> String {
+    value
+        .pointer(pointer)
+        .and_then(|number| number.as_u64())
+        .map(|number| number.to_string())
+        .unwrap_or_else(|| "нет данных".into())
+}
+
+fn response_diagnostics(value: &serde_json::Value) -> String {
+    let finish_reason = safe_response_label(
+        value
+            .pointer("/choices/0/finish_reason")
+            .and_then(|reason| reason.as_str()),
+    );
+    let content = response_text_state(value, "/choices/0/message/content");
+    let reasoning = response_text_state(value, "/choices/0/message/reasoning_content");
+    let prompt_tokens = response_number(value, "/usage/prompt_tokens");
+    let completion_tokens = response_number(value, "/usage/completion_tokens");
+    let reasoning_tokens =
+        response_number(value, "/usage/completion_tokens_details/reasoning_tokens");
+    format!(
+        "метаданные API: finish_reason={finish_reason}; content={content}; reasoning={reasoning}; токены: prompt={prompt_tokens}, completion={completion_tokens}, reasoning={reasoning_tokens}"
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2132,10 +2204,32 @@ mod tests {
 
     #[test]
     fn invalid_json_has_a_clear_technical_error() {
-        let value = serde_json::json!({"choices":[{"message":{"content":"not json"}}]});
-        assert!(parse_model_response(&value)
-            .unwrap_err()
-            .contains("невалидный JSON"));
+        let value = serde_json::json!({
+            "choices":[{"finish_reason":"length", "message":{"content":"not json", "reasoning_content":"private chain of thought"}}],
+            "usage":{"prompt_tokens":12,"completion_tokens":34,"completion_tokens_details":{"reasoning_tokens":21}}
+        });
+        let error = parse_model_response(&value).unwrap_err();
+        assert!(error.contains("невалидный JSON"));
+        assert!(error.contains("finish_reason=length"));
+        assert!(error.contains("content=8 симв."));
+        assert!(error.contains("reasoning=24 симв."));
+        assert!(error.contains("prompt=12, completion=34, reasoning=21"));
+        assert!(!error.contains("private chain of thought"));
+    }
+
+    #[test]
+    fn empty_model_content_has_anonymized_response_diagnostics() {
+        let value = serde_json::json!({
+            "choices":[{"finish_reason":"stop", "message":{"content":"", "reasoning_content":"internal data"}}],
+            "usage":{"prompt_tokens":8,"completion_tokens":9}
+        });
+        let error = parse_model_response(&value).unwrap_err();
+        assert!(error.contains("Ответ модели пустой"));
+        assert!(error.contains("finish_reason=stop"));
+        assert!(error.contains("content=пусто"));
+        assert!(error.contains("reasoning=13 симв."));
+        assert!(!error.contains("internal data"));
+        assert_eq!(anonymized_error(&error).0, "empty_content");
     }
 
     #[test]
