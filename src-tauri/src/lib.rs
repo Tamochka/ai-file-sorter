@@ -184,6 +184,7 @@ struct AnalysisLogEvent {
     unresolved_files: usize,
     skipped_files: usize,
     input_bytes: Option<usize>,
+    full_context: bool,
     error_kind: Option<String>,
     error_detail: Option<String>,
 }
@@ -217,7 +218,6 @@ const AI_BATCH_SIZE: usize = 10;
 // This cap applies to the whole request, after the user-selected per-file text limit.
 // It keeps local models from receiving an unbounded prompt.
 const MAX_BATCH_CONTEXT_BYTES: usize = 8_000;
-const MAX_CUSTOM_PROMPT_CHARS: usize = 600;
 const AI_BATCH_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const STANDARD_CATEGORIES: [&str; 8] = [
@@ -312,6 +312,7 @@ async fn analyze_folder(
             unresolved_files: 0,
             skipped_files: inaccessible_files,
             input_bytes: None,
+            full_context: false,
             error_kind: None,
             error_detail: None,
         },
@@ -360,12 +361,7 @@ fn prepare_analysis(
     let mut inaccessible_files = 0usize;
     if sort.unlimited {
         warnings.push(format!(
-            "Без общего лимита: для каждого файла используется заданный лимит текста, а один запрос к ИИ ограничен {MAX_BATCH_CONTEXT_BYTES} байтами контекста."
-        ));
-    }
-    if sort.mode == "custom" && sort.custom_prompt.chars().count() > MAX_CUSTOM_PROMPT_CHARS {
-        warnings.push(format!(
-            "Для устойчивости в ИИ передаются только первые {MAX_CUSTOM_PROMPT_CHARS} символов пользовательской инструкции."
+            "Без общего лимита: для каждого файла используется заданный лимит текста, а основной запрос к ИИ ограничен {MAX_BATCH_CONTEXT_BYTES} байтами контекста. При повторной проверке файл передаётся отдельно без лимита приложения."
         ));
     }
     for entry in WalkDir::new(&root).into_iter().filter_entry(scan_entry) {
@@ -577,6 +573,10 @@ fn model_batch_ranges(contexts: &[AiFileContext]) -> Vec<Range<usize>> {
     }
     ranges.push(start..contexts.len());
     ranges
+}
+
+fn retry_batch_ranges(contexts: &[AiFileContext]) -> Vec<Range<usize>> {
+    (0..contexts.len()).map(|index| index..index + 1).collect()
 }
 
 fn anonymized_error(error: &str) -> (String, String) {
@@ -1193,8 +1193,24 @@ fn restricted_category(value: &str, fallback: &str) -> String {
     category.unwrap_or(safe_fallback).to_string()
 }
 
-fn bounded_custom_prompt(value: &str) -> String {
-    value.chars().take(MAX_CUSTOM_PROMPT_CHARS).collect()
+fn custom_category(value: &str, fallback: &str) -> String {
+    if value.trim().is_empty() {
+        safe_name(fallback)
+    } else {
+        safe_name(value)
+    }
+}
+
+fn model_instruction(sort: &SortSettings) -> String {
+    let category_rule = "Категория должна быть ровно одной из: Работа, Личное, Финансы, Учёба, Медиа, Архив, Загрузчики, Прочее.";
+    if sort.mode == "custom" && !sort.custom_prompt.trim().is_empty() {
+        format!(
+            "Следуй пользовательской структуре категорий ниже целиком. Используй названия категорий из этой инструкции и не заменяй их фиксированными стандартными категориями. Пользовательская инструкция:\n{}",
+            sort.custom_prompt.trim()
+        )
+    } else {
+        format!("{category_rule} Установочные файлы с расширениями DMG, EXE, PKG, MSI и похожими всегда относятся к Загрузчикам.")
+    }
 }
 
 fn unsupported_warning(ext: &str) -> Option<String> {
@@ -1274,6 +1290,24 @@ fn read_text_preview(path: &Path, ext: &str, limit: usize) -> (Option<String>, S
         ),
     }
 }
+
+fn full_retry_context(context: &AiFileContext, items: &[PlanItem]) -> AiFileContext {
+    let Some(item) = items.iter().find(|item| item.id == context.id) else {
+        return context.clone();
+    };
+    let (content_extract, content_status) =
+        read_text_preview(Path::new(&item.source), &context.extension, usize::MAX);
+    let mut retry = context.clone();
+    retry.content_extract = content_extract;
+    retry.content_status = if retry.content_extract.is_some() {
+        "Повторная проверка: передано всё доступное текстовое содержимое без лимита приложения."
+            .into()
+    } else {
+        content_status
+    };
+    retry
+}
+
 fn classify(relative: &Path, ext: &str, _sort: &SortSettings) -> (String, f32, String) {
     let name = relative.to_string_lossy().to_lowercase();
     let installer = matches!(
@@ -1347,6 +1381,12 @@ enum BatchError {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelRequestKind {
+    Main,
+    FullRetry,
+}
+
 async fn refine_with_model<P, L>(
     client: &reqwest::Client,
     ai: &AiSettings,
@@ -1366,7 +1406,7 @@ where
         sort,
         items,
         contexts,
-        move |batch| {
+        move |batch, request_kind| {
             request_model_batch(
                 client,
                 ai,
@@ -1374,6 +1414,7 @@ where
                 batch,
                 request_cancelled.clone(),
                 AI_BATCH_TIMEOUT,
+                request_kind,
             )
         },
         progress,
@@ -1389,27 +1430,25 @@ async fn request_model_batch(
     batch: Vec<AiFileContext>,
     cancelled: Arc<AtomicBool>,
     hard_timeout: Duration,
+    request_kind: ModelRequestKind,
 ) -> Result<Vec<AiDecision>, BatchError> {
     if cancelled.load(Ordering::Acquire) {
         return Err(BatchError::Cancelled);
     }
     let context_bytes = model_batch_context_bytes(&batch);
-    if context_bytes > MAX_BATCH_CONTEXT_BYTES {
+    if request_kind == ModelRequestKind::Main && context_bytes > MAX_BATCH_CONTEXT_BYTES {
         return Err(BatchError::Failure(format!(
             "Входной контекст пакета ({context_bytes} байт) превышает безопасный лимит {MAX_BATCH_CONTEXT_BYTES} байт."
         )));
     }
-    let category_rule = "Категория должна быть ровно одной из: Работа, Личное, Финансы, Учёба, Медиа, Архив, Загрузчики, Прочее.";
-    let instruction = if sort.mode == "custom" && !sort.custom_prompt.trim().is_empty() {
-        format!(
-            "{category_rule} Дополнительная инструкция пользователя: {}",
-            bounded_custom_prompt(&sort.custom_prompt)
-        )
+    let instruction = model_instruction(sort);
+    let batch_description = if request_kind == ModelRequestKind::FullRetry {
+        "Классифицируй файл в повторном проходе. Для него передан весь доступный текст без лимита приложения."
     } else {
-        format!("{category_rule} Установочные файлы с расширениями DMG, EXE, PKG, MSI и похожими всегда относятся к Загрузчикам.")
+        "Классифицируй только этот небольшой пакет файлов."
     };
     let url = chat_completions_url(ai);
-    let prompt = format!("Классифицируй только этот небольшой пакет файлов. Инструкция: {instruction}\nДля каждого файла сначала используй contentExtract, если он есть. Если его нет, анализируй только метаданные: path, extension, sizeBytes, даты и suggestedCategory. Не выдумывай содержимое. Верни ТОЛЬКО компактный JSON-массив объектов {{id, category, confidence}}. Без explanation, Markdown и любого текста вне JSON. Верни ровно одно решение для каждого переданного id.\nФайлы: {}", serde_json::to_string(&batch).map_err(|error| BatchError::Failure(error.to_string()))?);
+    let prompt = format!("{batch_description} Инструкция: {instruction}\nДля каждого файла сначала используй contentExtract, если он есть. Если его нет, анализируй только метаданные: path, extension, sizeBytes, даты и suggestedCategory. Не выдумывай содержимое. Верни ТОЛЬКО компактный JSON-массив объектов {{id, category, confidence}}. Без explanation, Markdown и любого текста вне JSON. Верни ровно одно решение для каждого переданного id.\nФайлы: {}", serde_json::to_string(&batch).map_err(|error| BatchError::Failure(error.to_string()))?);
     let body = serde_json::json!({"model":ai.model,"temperature":0,"messages":[{"role":"system","content":"Отвечай только компактным валидным JSON-массивом. Каждый объект: id, category, confidence. Никакого Markdown, explanation или текста вне JSON."},{"role":"user","content":prompt}]});
     let mut request = client.post(&url).json(&body);
     if !ai.api_key.trim().is_empty() {
@@ -1588,6 +1627,7 @@ fn batch_log_event(
     outcome: &str,
     successful_files: usize,
     unresolved_files: usize,
+    full_context: bool,
     error_kind: Option<String>,
     error_detail: Option<String>,
 ) -> AnalysisLogEvent {
@@ -1604,6 +1644,7 @@ fn batch_log_event(
         unresolved_files,
         skipped_files: 0,
         input_bytes: Some(model_batch_context_bytes(batch)),
+        full_context,
         error_kind,
         error_detail,
     }
@@ -1618,7 +1659,7 @@ async fn refine_in_batches<F, Fut, P, L>(
     mut log_event: L,
 ) -> Result<AiRefinement, String>
 where
-    F: FnMut(Vec<AiFileContext>) -> Fut,
+    F: FnMut(Vec<AiFileContext>, ModelRequestKind) -> Fut,
     Fut: Future<Output = Result<Vec<AiDecision>, BatchError>>,
     P: FnMut(AnalysisProgress),
     L: FnMut(AnalysisLogEvent),
@@ -1656,7 +1697,7 @@ where
             message: format!("Основной проход: пакет {} из {main_batches}…", index + 1),
         });
         let batch_started = Instant::now();
-        match request_batch(batch.to_vec()).await {
+        match request_batch(batch.to_vec(), ModelRequestKind::Main).await {
             Ok(decisions) => {
                 let missing = apply_batch_decisions(sort, items, batch, decisions);
                 let successful = batch.len() - missing.len();
@@ -1682,6 +1723,7 @@ where
                     },
                     successful,
                     missing.len(),
+                    false,
                     (!missing.is_empty()).then(|| "partial_response".into()),
                     (!missing.is_empty())
                         .then(|| "Модель не вернула решения для части файлов пакета".into()),
@@ -1703,6 +1745,7 @@ where
                     "error",
                     0,
                     batch.len(),
+                    false,
                     Some(error_kind),
                     Some(error_detail),
                 ));
@@ -1718,6 +1761,7 @@ where
                     "cancelled",
                     0,
                     batch.len(),
+                    false,
                     Some("cancelled".into()),
                     Some("Анализ отменён пользователем".into()),
                 ));
@@ -1744,9 +1788,9 @@ where
     let retry_contexts: Vec<AiFileContext> = contexts
         .iter()
         .filter(|context| item_status(items, &context.id) == Some(AiStatus::RetryPending))
-        .cloned()
+        .map(|context| full_retry_context(context, items))
         .collect();
-    let retry_batch_ranges = model_batch_ranges(&retry_contexts);
+    let retry_batch_ranges = retry_batch_ranges(&retry_contexts);
     let retry_batches = retry_batch_ranges.len();
     for (index, range) in retry_batch_ranges.iter().enumerate() {
         let batch = &retry_contexts[range.clone()];
@@ -1761,7 +1805,7 @@ where
             message: format!("Повторный проход: пакет {} из {retry_batches}…", index + 1),
         });
         let batch_started = Instant::now();
-        match request_batch(batch.to_vec()).await {
+        match request_batch(batch.to_vec(), ModelRequestKind::FullRetry).await {
             Ok(decisions) => {
                 let missing = apply_batch_decisions(sort, items, batch, decisions);
                 let successful = batch.len() - missing.len();
@@ -1788,6 +1832,7 @@ where
                     },
                     successful,
                     missing.len(),
+                    true,
                     (!missing.is_empty()).then(|| "partial_response".into()),
                     (!missing.is_empty()).then(|| {
                         "Модель повторно не вернула решения для части файлов пакета".into()
@@ -1820,6 +1865,7 @@ where
                     "error",
                     0,
                     batch.len(),
+                    true,
                     Some(error_kind),
                     Some(error_detail),
                 ));
@@ -1835,6 +1881,7 @@ where
                     "cancelled",
                     0,
                     batch.len(),
+                    true,
                     Some("cancelled".into()),
                     Some("Анализ отменён пользователем".into()),
                 ));
@@ -1934,7 +1981,11 @@ fn apply_ai_decision(sort: &SortSettings, items: &mut [PlanItem], decision: AiDe
         return;
     };
     if !(sort.mode == "standard" && item.category == "Загрузчики") {
-        let category = restricted_category(&decision.category, &item.category);
+        let category = if sort.mode == "custom" && !sort.custom_prompt.trim().is_empty() {
+            custom_category(&decision.category, &item.category)
+        } else {
+            restricted_category(&decision.category, &item.category)
+        };
         item.category = category.clone();
         retarget_item(item, &category);
     }
@@ -2061,7 +2112,7 @@ mod tests {
             &test_sort(),
             &mut items,
             &contexts,
-            |batch| {
+            |batch, _| {
                 calls += 1;
                 std::future::ready(Ok(decisions(&batch)))
             },
@@ -2092,7 +2143,7 @@ mod tests {
             &test_sort(),
             &mut items,
             &contexts,
-            |batch| {
+            |batch, _| {
                 calls += 1;
                 let response = if calls == 2 {
                     Err(BatchError::Failure("Тайм-аут основного пакета".into()))
@@ -2106,7 +2157,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(calls, 4);
+        assert_eq!(calls, 13);
         assert_eq!(
             result.summary,
             AiSummary {
@@ -2127,7 +2178,7 @@ mod tests {
             &test_sort(),
             &mut items,
             &contexts,
-            |batch| {
+            |batch, _| {
                 calls += 1;
                 let response = match calls {
                     1 => Ok(decisions(&batch)),
@@ -2172,7 +2223,7 @@ mod tests {
             &test_sort(),
             &mut items,
             &contexts,
-            |batch| {
+            |batch, _| {
                 calls += 1;
                 let response = if calls == 1 {
                     Ok(decisions(&batch[..3]))
@@ -2186,7 +2237,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(calls, 3);
+        assert_eq!(calls, 9);
         assert_eq!(
             result.summary,
             AiSummary {
@@ -2344,7 +2395,7 @@ mod tests {
             &test_sort(),
             &mut items,
             &contexts,
-            |batch| std::future::ready(Ok(decisions(&batch))),
+            |batch, _| std::future::ready(Ok(decisions(&batch))),
             |progress| progress_events.push(progress),
             |event| log_events.push(event),
         )
@@ -2401,6 +2452,7 @@ mod tests {
             contexts,
             Arc::new(AtomicBool::new(false)),
             Duration::from_millis(100),
+            ModelRequestKind::Main,
         )
         .await;
         server.abort();
@@ -2429,6 +2481,7 @@ mod tests {
             contexts,
             Arc::new(AtomicBool::new(true)),
             Duration::from_secs(1),
+            ModelRequestKind::Main,
         )
         .await;
         assert!(matches!(result, Err(BatchError::Cancelled)));
@@ -2465,6 +2518,7 @@ mod tests {
             contexts,
             cancelled,
             Duration::from_secs(5),
+            ModelRequestKind::Main,
         )
         .await;
         server.abort();
@@ -2722,7 +2776,7 @@ mod tests {
     }
 
     #[test]
-    fn model_categories_cannot_create_new_top_level_folders() {
+    fn standard_model_categories_stay_within_the_fixed_set() {
         assert_eq!(restricted_category("Business", "Личное"), "Работа");
         assert_eq!(restricted_category("Adello Visuals", "Личное"), "Личное");
         assert_eq!(
@@ -2732,10 +2786,25 @@ mod tests {
     }
 
     #[test]
-    fn custom_instruction_has_a_hard_character_limit() {
-        let prompt = "я".repeat(MAX_CUSTOM_PROMPT_CHARS + 1);
-        let bounded = bounded_custom_prompt(&prompt);
-        assert_eq!(bounded.chars().count(), MAX_CUSTOM_PROMPT_CHARS);
+    fn custom_instruction_and_category_are_not_restricted_to_standard_categories() {
+        let mut sort = test_sort();
+        sort.mode = "custom".into();
+        sort.custom_prompt = format!("Бизнес\n{}", "Детальная структура ".repeat(80));
+        let instruction = model_instruction(&sort);
+        assert!(instruction.contains(sort.custom_prompt.trim()));
+        let (mut items, _) = plan(1);
+        apply_ai_decision(
+            &sort,
+            &mut items,
+            AiDecision {
+                id: "file-0".into(),
+                category: "Adello Visuals".into(),
+                explanation: None,
+                confidence: None,
+            },
+        );
+        assert_eq!(items[0].category, "Adello Visuals");
+        assert_eq!(items[0].target, "AI Sorted/Adello Visuals/file-0.txt");
     }
 
     #[test]
@@ -2753,6 +2822,22 @@ mod tests {
         let (preview, status) = read_text_preview(&path, "txt", 5);
         assert_eq!(preview.as_deref(), Some("😀😀😀😀😀"));
         assert!(status.contains("фрагмент"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn retry_reads_full_source_text_and_sends_one_file_without_the_context_cap() {
+        let path =
+            std::env::temp_dir().join(format!("ai-file-sorter-retry-{}.txt", Uuid::new_v4()));
+        let source_text = "a".repeat(MAX_BATCH_CONTEXT_BYTES * 2);
+        fs::write(&path, &source_text).unwrap();
+        let (mut items, mut contexts) = plan(1);
+        items[0].source = path.to_string_lossy().into_owned();
+        contexts[0].content_extract = Some("a".repeat(100));
+        let retry = full_retry_context(&contexts[0], &items);
+        assert_eq!(retry.content_extract.as_deref(), Some(source_text.as_str()));
+        assert!(model_context_bytes(&retry) > MAX_BATCH_CONTEXT_BYTES);
+        assert_eq!(retry_batch_ranges(&[retry]), vec![0..1]);
         fs::remove_file(path).unwrap();
     }
 
