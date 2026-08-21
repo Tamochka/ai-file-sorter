@@ -36,7 +36,14 @@ struct SortSettings {
     total_limit: usize,
     #[serde(default)]
     unlimited: bool,
+    #[serde(default = "default_preserve_folder_trees")]
+    preserve_folder_trees: bool,
 }
+
+fn default_preserve_folder_trees() -> bool {
+    true
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct PlanItem {
@@ -51,6 +58,8 @@ struct PlanItem {
     warning: Option<String>,
     ai_status: AiStatus,
     ai_error: Option<String>,
+    #[serde(default)]
+    is_folder: bool,
 }
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -79,6 +88,32 @@ struct AiSummary {
 struct MoveRecord {
     from: String,
     to: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct MoveHistory {
+    moves: Vec<MoveRecord>,
+    #[serde(default)]
+    removed_empty_dirs: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum SavedMoveHistory {
+    Current(MoveHistory),
+    Legacy(Vec<MoveRecord>),
+}
+
+impl SavedMoveHistory {
+    fn into_history(self) -> MoveHistory {
+        match self {
+            Self::Current(history) => history,
+            Self::Legacy(moves) => MoveHistory {
+                moves,
+                removed_empty_dirs: Vec::new(),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -364,7 +399,8 @@ fn prepare_analysis(
             "Без общего лимита: для каждого файла используется заданный лимит текста, а основной запрос к ИИ ограничен {MAX_BATCH_CONTEXT_BYTES} байтами контекста. При повторной проверке файл передаётся отдельно без лимита приложения."
         ));
     }
-    for entry in WalkDir::new(&root).into_iter().filter_entry(scan_entry) {
+    let mut walker = WalkDir::new(&root).into_iter();
+    while let Some(entry) = walker.next() {
         if cancelled.load(Ordering::Acquire) {
             return Err("Анализ отменён пользователем".into());
         }
@@ -375,10 +411,68 @@ fn prepare_analysis(
                 continue;
             }
         };
-        if !entry.file_type().is_file() {
+        if entry.depth() == 0 {
+            continue;
+        }
+        if !scan_entry(&entry) {
+            if entry.file_type().is_dir() {
+                walker.skip_current_dir();
+            }
             continue;
         }
         let path = entry.path();
+        if entry.file_type().is_dir() {
+            let nested_folders = count_child_directories(path);
+            if sort.preserve_folder_trees && nested_folders > 0 {
+                let relative = path
+                    .strip_prefix(&root)
+                    .map_err(|_| "Не удалось вычислить относительный путь")?;
+                let metadata = match fs::metadata(path) {
+                    Ok(data) => data,
+                    Err(_) => {
+                        inaccessible_files += 1;
+                        walker.skip_current_dir();
+                        continue;
+                    }
+                };
+                let (category, confidence, _) = classify(relative, "folder", sort);
+                let target = planned_target(&category, relative);
+                let id = Uuid::new_v4().to_string();
+                contexts.push(AiFileContext {
+                    id: id.clone(),
+                    path: relative.to_string_lossy().into_owned(),
+                    extension: "folder".into(),
+                    size_bytes: metadata.len(),
+                    created_at: format_file_time(metadata.created().ok()),
+                    modified_at: format_file_time(metadata.modified().ok()),
+                    suggested_category: category.clone(),
+                    content_extract: None,
+                    content_status: format!(
+                        "Папка с {nested_folders} вложенными папками будет перенесена целиком; содержимое не извлекается."
+                    ),
+                });
+                items.push(PlanItem {
+                    id,
+                    source: path.to_string_lossy().into_owned(),
+                    relative_path: relative.to_string_lossy().into_owned(),
+                    target: target.to_string_lossy().into_owned(),
+                    category,
+                    explanation: "Папка с вложенными папками сохранена целиком; ИИ определит общую категорию."
+                        .into(),
+                    confidence,
+                    included: true,
+                    warning: Some("Папка будет перемещена целиком вместе с вложенными файлами и папками.".into()),
+                    ai_status: AiStatus::RetryPending,
+                    ai_error: None,
+                    is_folder: true,
+                });
+                walker.skip_current_dir();
+            }
+            continue;
+        }
+        if !entry.file_type().is_file() {
+            continue;
+        }
         let relative = path
             .strip_prefix(&root)
             .map_err(|_| "Не удалось вычислить относительный путь")?;
@@ -439,6 +533,7 @@ fn prepare_analysis(
             warning: unsupported_warning(&ext),
             ai_status: AiStatus::RetryPending,
             ai_error: None,
+            is_folder: false,
         });
     }
     if sort.mode == "custom" && sort.custom_prompt.trim().is_empty() {
@@ -633,8 +728,9 @@ fn apply_sort(folder: String, items: Vec<PlanItem>) -> Result<usize, String> {
     let root = canonical_root(&folder)?;
     ensure_root_writable(&root)?;
     let mut planned = Vec::new();
+    let mut cleanup_dirs = Vec::new();
     let mut reserved_destinations = HashSet::new();
-    let mut seen_sources = HashSet::new();
+    let mut seen_sources = Vec::new();
     for item in items {
         if !item.included {
             continue;
@@ -644,36 +740,68 @@ fn apply_sort(folder: String, items: Vec<PlanItem>) -> Result<usize, String> {
         if source == destination {
             continue;
         }
-        if !seen_sources.insert(normalized_path_key(&source)) {
-            return Err("Один исходный файл добавлен в план несколько раз".into());
+        if seen_sources
+            .iter()
+            .any(|known: &PathBuf| source.starts_with(known) || known.starts_with(&source))
+        {
+            return Err("В план одновременно добавлены папка и объект внутри неё".into());
         }
-        let destination = conflict_free_reserved(&destination, &mut reserved_destinations);
-        planned.push(PlannedMove {
-            from: source,
-            to: destination,
-        });
+        seen_sources.push(source.clone());
+        if source.is_dir() && destination.is_dir() {
+            plan_folder_merge(
+                &source,
+                &destination,
+                &mut planned,
+                &mut cleanup_dirs,
+                &mut reserved_destinations,
+            )?;
+        } else {
+            let destination = conflict_free_reserved(&destination, &mut reserved_destinations);
+            planned.push(PlannedMove {
+                from: source,
+                to: destination,
+            });
+        }
     }
-    if planned.is_empty() {
+    if planned.is_empty() && cleanup_dirs.is_empty() {
         return Ok(0);
     }
 
-    let records: Vec<MoveRecord> = planned
+    let moves: Vec<MoveRecord> = planned
         .iter()
         .map(|operation| MoveRecord {
             from: operation.from.to_string_lossy().into_owned(),
             to: operation.to.to_string_lossy().into_owned(),
         })
         .collect();
-    let history_data = serde_json::to_vec_pretty(&records).map_err(|e| e.to_string())?;
     let completed = execute_moves(&planned)?;
+    let removed_empty_dirs = match remove_empty_directories(&cleanup_dirs) {
+        Ok(directories) => directories,
+        Err(error) => {
+            return Err(operation_error_with_rollback(
+                "Не удалось завершить объединение папок",
+                &error,
+                &completed,
+            ));
+        }
+    };
+    let history = MoveHistory {
+        moves,
+        removed_empty_dirs: removed_empty_dirs
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect(),
+    };
+    let history_data = serde_json::to_vec_pretty(&history).map_err(|e| e.to_string())?;
     if let Err(error) = write_history(&root, &history_data) {
-        return Err(operation_error_with_rollback(
+        return Err(operation_error_with_folder_rollback(
             "Не удалось сохранить журнал отмены",
             &error,
             &completed,
+            &removed_empty_dirs,
         ));
     }
-    Ok(completed.len())
+    Ok(completed.len() + removed_empty_dirs.len())
 }
 
 #[tauri::command]
@@ -681,13 +809,17 @@ fn undo_last_sort(folder: String) -> Result<usize, String> {
     let root = canonical_root(&folder)?;
     let history = root.join(HISTORY_FILE);
     let raw = fs::read(&history).map_err(|_| "Нет операции для отмены".to_string())?;
-    let records: Vec<MoveRecord> =
+    let history_data: SavedMoveHistory =
         serde_json::from_slice(&raw).map_err(|_| "Журнал операции повреждён".to_string())?;
+    let MoveHistory {
+        moves,
+        removed_empty_dirs,
+    } = history_data.into_history();
     ensure_root_writable(&root)?;
     let mut planned = Vec::new();
     let mut reserved_destinations = HashSet::new();
     let mut seen_sources = HashSet::new();
-    for record in records.into_iter().rev() {
+    for record in moves.into_iter().rev() {
         let current = canonical_inside(&root, Path::new(&record.to))?;
         let original = safe_recorded_destination(&root, Path::new(&record.from))?;
         if !seen_sources.insert(normalized_path_key(&current)) {
@@ -700,6 +832,13 @@ fn undo_last_sort(folder: String) -> Result<usize, String> {
         });
     }
     let completed = execute_moves(&planned)?;
+    if let Err(error) = restore_empty_directories(&root, &removed_empty_dirs) {
+        return Err(operation_error_with_rollback(
+            "Не удалось восстановить пустые папки",
+            &error,
+            &completed,
+        ));
+    }
     if let Err(error) = fs::remove_file(history) {
         return Err(operation_error_with_rollback(
             "Не удалось удалить использованный журнал отмены",
@@ -708,6 +847,86 @@ fn undo_last_sort(folder: String) -> Result<usize, String> {
         ));
     }
     Ok(completed.len())
+}
+
+fn plan_folder_merge(
+    source: &Path,
+    destination: &Path,
+    planned: &mut Vec<PlannedMove>,
+    cleanup_dirs: &mut Vec<PathBuf>,
+    reserved_destinations: &mut HashSet<String>,
+) -> Result<(), String> {
+    let mut children: Vec<PathBuf> = fs::read_dir(source)
+        .map_err(io_error)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect();
+    children.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
+
+    for child in children {
+        let name = child
+            .file_name()
+            .ok_or("Не удалось прочитать имя объекта в папке")?;
+        let target = destination.join(name);
+        if child.is_dir() && target.is_dir() {
+            plan_folder_merge(
+                &child,
+                &target,
+                planned,
+                cleanup_dirs,
+                reserved_destinations,
+            )?;
+        } else {
+            let target = conflict_free_reserved(&target, reserved_destinations);
+            planned.push(PlannedMove {
+                from: child,
+                to: target,
+            });
+        }
+    }
+    cleanup_dirs.push(source.to_path_buf());
+    Ok(())
+}
+
+fn remove_empty_directories(directories: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+    let mut ordered = directories.to_vec();
+    ordered.sort_by(|left, right| {
+        right
+            .components()
+            .count()
+            .cmp(&left.components().count())
+            .then_with(|| normalized_path_key(left).cmp(&normalized_path_key(right)))
+    });
+    let mut removed = Vec::new();
+    let mut seen = HashSet::new();
+    for directory in ordered {
+        if !seen.insert(normalized_path_key(&directory)) || !directory.exists() {
+            continue;
+        }
+        fs::remove_dir(&directory).map_err(io_error)?;
+        removed.push(directory);
+    }
+    Ok(removed)
+}
+
+fn recreate_empty_directories(directories: &[PathBuf]) -> Result<(), String> {
+    let mut ordered = directories.to_vec();
+    ordered.sort_by_key(|path| path.components().count());
+    for directory in ordered {
+        if directory.exists() && !directory.is_dir() {
+            return Err("На месте исходной папки появился файл".into());
+        }
+        fs::create_dir_all(directory).map_err(io_error)?;
+    }
+    Ok(())
+}
+
+fn restore_empty_directories(root: &Path, recorded: &[String]) -> Result<(), String> {
+    let directories: Result<Vec<PathBuf>, String> = recorded
+        .iter()
+        .map(|path| safe_recorded_destination(root, Path::new(path)))
+        .collect();
+    recreate_empty_directories(&directories?)
 }
 
 #[tauri::command]
@@ -858,6 +1077,17 @@ fn scan_entry(entry: &walkdir::DirEntry) -> bool {
             || normalized == "$recycle.bin"
             || normalized == "system volume information"))
 }
+
+fn count_child_directories(path: &Path) -> usize {
+    fs::read_dir(path)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .count()
+}
+
 fn skip_file(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
@@ -1001,14 +1231,14 @@ fn execute_moves(planned: &[PlannedMove]) -> Result<Vec<PlannedMove>, String> {
         }
         if operation.to.exists() {
             return Err(operation_error_with_rollback(
-                "Целевой файл появился после проверки конфликтов",
+                "Целевой объект появился после проверки конфликтов",
                 "операция остановлена, чтобы не перезаписать существующий файл",
                 &completed,
             ));
         }
         if let Err(error) = fs::rename(&operation.from, &operation.to) {
             return Err(operation_error_with_rollback(
-                "Не удалось переместить файл",
+                "Не удалось переместить объект",
                 &error.to_string(),
                 &completed,
             ));
@@ -1048,6 +1278,22 @@ fn operation_error_with_rollback(context: &str, error: &str, completed: &[Planne
     }
     match rollback_moves(completed) {
         Ok(()) => format!("{context}: {error}. Уже перемещённые файлы возвращены обратно"),
+        Err(rollback_error) => format!(
+            "{context}: {error}. ВНИМАНИЕ: автоматический откат выполнен не полностью ({rollback_error})"
+        ),
+    }
+}
+
+fn operation_error_with_folder_rollback(
+    context: &str,
+    error: &str,
+    completed: &[PlannedMove],
+    removed_empty_dirs: &[PathBuf],
+) -> String {
+    let rollback_result =
+        rollback_moves(completed).and_then(|_| recreate_empty_directories(removed_empty_dirs));
+    match rollback_result {
+        Ok(()) => format!("{context}: {error}. Уже перемещённые объекты возвращены обратно"),
         Err(rollback_error) => format!(
             "{context}: {error}. ВНИМАНИЕ: автоматический откат выполнен не полностью ({rollback_error})"
         ),
@@ -1292,6 +1538,9 @@ fn read_text_preview(path: &Path, ext: &str, limit: usize) -> (Option<String>, S
 }
 
 fn full_retry_context(context: &AiFileContext, items: &[PlanItem]) -> AiFileContext {
+    if context.extension == "folder" {
+        return context.clone();
+    }
     let Some(item) = items.iter().find(|item| item.id == context.id) else {
         return context.clone();
     };
@@ -2055,6 +2304,7 @@ mod tests {
             text_limit: 1,
             total_limit: 1,
             unlimited: false,
+            preserve_folder_trees: true,
         }
     }
 
@@ -2076,6 +2326,7 @@ mod tests {
                 warning: None,
                 ai_status: AiStatus::RetryPending,
                 ai_error: None,
+                is_folder: false,
             });
             contexts.push(AiFileContext {
                 id,
@@ -2554,6 +2805,7 @@ mod tests {
             warning: None,
             ai_status: AiStatus::Processed,
             ai_error: None,
+            is_folder: false,
         };
         assert_eq!(
             apply_sort(root.to_string_lossy().into_owned(), vec![item]).unwrap(),
@@ -2589,6 +2841,7 @@ mod tests {
             warning: None,
             ai_status: AiStatus::Processed,
             ai_error: None,
+            is_folder: false,
         };
         assert_eq!(
             apply_sort(root.to_string_lossy().into_owned(), vec![item]).unwrap(),
@@ -2599,6 +2852,103 @@ mod tests {
             "new"
         );
         assert_eq!(fs::read_to_string(&target).unwrap(), "existing");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn nested_folder_is_planned_once_and_not_split_into_files() {
+        let root =
+            std::env::temp_dir().join(format!("ai-file-sorter-folder-plan-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("анапа2007/Дом")).unwrap();
+        fs::create_dir_all(root.join("анапа2007/Малышка")).unwrap();
+        fs::write(root.join("анапа2007/Дом/photo.jpg"), "home").unwrap();
+        fs::write(root.join("анапа2007/Малышка/photo.jpg"), "baby").unwrap();
+
+        let prepared = prepare_analysis(
+            root.to_string_lossy().into_owned(),
+            &test_sort(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(prepared.items.len(), 1);
+        assert!(prepared.items[0].is_folder);
+        assert_eq!(prepared.items[0].relative_path, "анапа2007");
+        assert_eq!(prepared.contexts[0].extension, "folder");
+        assert!(prepared.contexts[0].content_status.contains("целиком"));
+
+        let mut split_sort = test_sort();
+        split_sort.preserve_folder_trees = false;
+        let split = prepare_analysis(
+            root.to_string_lossy().into_owned(),
+            &split_sort,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(split.items.len(), 2);
+        assert!(split.items.iter().all(|item| !item.is_folder));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn matching_folder_trees_merge_without_overwriting_and_undo_restores_them() {
+        let root =
+            std::env::temp_dir().join(format!("ai-file-sorter-folder-merge-{}", Uuid::new_v4()));
+        let source = root.join("анапа2007");
+        let target = root.join("AI Sorted/Личное/анапа2007");
+        fs::create_dir_all(source.join("Дом")).unwrap();
+        fs::create_dir_all(source.join("Малышка")).unwrap();
+        fs::create_dir_all(source.join("Пустая")).unwrap();
+        fs::create_dir_all(target.join("Дом")).unwrap();
+        fs::create_dir_all(target.join("Пустая")).unwrap();
+        fs::write(source.join("Дом/photo.jpg"), "new home").unwrap();
+        fs::write(source.join("Малышка/photo.jpg"), "baby").unwrap();
+        fs::write(target.join("Дом/photo.jpg"), "existing home").unwrap();
+        let item = PlanItem {
+            id: "folder-merge".into(),
+            source: source.to_string_lossy().into_owned(),
+            relative_path: "анапа2007".into(),
+            target: "AI Sorted/Личное/анапа2007".into(),
+            category: "Личное".into(),
+            explanation: "Папка целиком".into(),
+            confidence: 1.0,
+            included: true,
+            warning: None,
+            ai_status: AiStatus::Processed,
+            ai_error: None,
+            is_folder: true,
+        };
+
+        assert!(apply_sort(root.to_string_lossy().into_owned(), vec![item]).unwrap() >= 2);
+        assert!(!source.exists());
+        assert_eq!(
+            fs::read_to_string(target.join("Дом/photo.jpg")).unwrap(),
+            "existing home"
+        );
+        assert_eq!(
+            fs::read_to_string(target.join("Дом/photo (2).jpg")).unwrap(),
+            "new home"
+        );
+        assert_eq!(
+            fs::read_to_string(target.join("Малышка/photo.jpg")).unwrap(),
+            "baby"
+        );
+
+        assert!(undo_last_sort(root.to_string_lossy().into_owned()).unwrap() >= 2);
+        assert_eq!(
+            fs::read_to_string(source.join("Дом/photo.jpg")).unwrap(),
+            "new home"
+        );
+        assert_eq!(
+            fs::read_to_string(source.join("Малышка/photo.jpg")).unwrap(),
+            "baby"
+        );
+        assert!(source.join("Пустая").is_dir());
+        assert_eq!(
+            fs::read_to_string(target.join("Дом/photo.jpg")).unwrap(),
+            "existing home"
+        );
+        assert!(!target.join("Дом/photo (2).jpg").exists());
+        assert!(!root.join(HISTORY_FILE).exists());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2706,6 +3056,7 @@ mod tests {
                 warning: None,
                 ai_status: AiStatus::Processed,
                 ai_error: None,
+                is_folder: false,
             },
             PlanItem {
                 id: "second".into(),
@@ -2719,6 +3070,7 @@ mod tests {
                 warning: None,
                 ai_status: AiStatus::Processed,
                 ai_error: None,
+                is_folder: false,
             },
         ];
         let error = apply_sort(root.to_string_lossy().into_owned(), items).unwrap_err();
@@ -2853,6 +3205,7 @@ mod tests {
             text_limit: 1_200,
             total_limit: usize::MAX,
             unlimited: true,
+            preserve_folder_trees: true,
         };
         let prepared = prepare_analysis(
             root.to_string_lossy().into_owned(),
